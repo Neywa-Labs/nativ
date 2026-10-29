@@ -96,6 +96,7 @@ final class AudioAnalyticsStore: ObservableObject {
     @Published private(set) var records: [AudioTranscriptionRecord] = []
 
     private let storageURL: URL
+    private var storageReadFailed = false
     private let calendar: Calendar
     private var cachedWordCounts: [String: Int] = [:]
     private var cachedTotalWords = 0
@@ -551,14 +552,16 @@ final class AudioAnalyticsStore: ObservableObject {
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: storageURL),
-              let decoded = try? JSONDecoder().decode(
-                [AudioTranscriptionRecord].self,
-                from: data
-              )
-        else {
-            records = []
-            rebuildDerivedMetrics()
+        let decoded: [AudioTranscriptionRecord]
+        do {
+            let data = try Data(contentsOf: storageURL)
+            decoded = try JSONDecoder().decode([AudioTranscriptionRecord].self, from: data)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            // A missing index is a new library; other failures must not reset it.
+            return
+        } catch {
+            storageReadFailed = true
+            NSLog("Nativ could not read voice analytics: %@", error.localizedDescription)
             return
         }
         var migratedImportedDates = false
@@ -579,6 +582,8 @@ final class AudioAnalyticsStore: ObservableObject {
     }
 
     private func save() {
+        // Older builds share this file with newer builds and may not understand its schema.
+        guard !storageReadFailed else { return }
         do {
             try FileManager.default.createDirectory(
                 at: storageURL.deletingLastPathComponent(),

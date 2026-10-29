@@ -64,6 +64,60 @@ final class NativSystemPermissionControllerTests: XCTestCase {
 
 @MainActor
 final class AudioAnalyticsStoreTests: XCTestCase {
+
+    func testImportPreservesUnsupportedOrMalformedIndex() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let storageURL = directory.appendingPathComponent("analytics.json")
+        try "Imported dictation".write(to: directory.appendingPathComponent("dictation.txt"), atomically: true, encoding: .utf8)
+
+        for original in [
+            Data(#"{"version":1,"records":[],"speakerProfiles":[{"id":"keep-me"}]}"#.utf8),
+            Data("{invalid JSON".utf8),
+        ] {
+            try original.write(to: storageURL)
+            let store = AudioAnalyticsStore(storageURL: storageURL)
+            store.importTranscripts(in: directory)
+            XCTAssertEqual(try Data(contentsOf: storageURL), original)
+        }
+    }
+
+    func testImportPreservesIndexAfterStorageReadFailure() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let storageURL = directory.appendingPathComponent("analytics.json")
+        // A directory at the file path forces a read failure, even with elevated permissions.
+        try FileManager.default.createDirectory(at: storageURL, withIntermediateDirectories: true)
+        let store = AudioAnalyticsStore(storageURL: storageURL)
+        try FileManager.default.removeItem(at: storageURL)
+        let original = Data("[]".utf8)
+        try original.write(to: storageURL)
+        try "Imported dictation".write(to: directory.appendingPathComponent("dictation.txt"), atomically: true, encoding: .utf8)
+
+        store.importTranscripts(in: directory)
+
+        XCTAssertEqual(try Data(contentsOf: storageURL), original)
+    }
+
+    func testImportStillCreatesAndUpdatesReadableIndex() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let storageURL = directory.appendingPathComponent("analytics.json")
+        let store = AudioAnalyticsStore(storageURL: storageURL)
+        try "First dictation".write(to: directory.appendingPathComponent("first.txt"), atomically: true, encoding: .utf8)
+        store.importTranscripts(in: directory)
+        let reloaded = AudioAnalyticsStore(storageURL: storageURL)
+        XCTAssertEqual(reloaded.records.map(\.transcript), ["First dictation"])
+
+        try "Second dictation".write(to: directory.appendingPathComponent("second.txt"), atomically: true, encoding: .utf8)
+        reloaded.importTranscripts(in: directory)
+
+        let saved = AudioAnalyticsStore(storageURL: storageURL)
+        XCTAssertEqual(Set(saved.records.map(\.transcript)), ["First dictation", "Second dictation"])
+    }
+
     private var temporaryDirectory: URL!
     private var store: AudioAnalyticsStore!
 
