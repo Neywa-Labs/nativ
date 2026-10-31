@@ -8,6 +8,7 @@ private enum AudioDestination: String, CaseIterable, Identifiable {
     case overview
     case record
     case history
+    case speakers
     case model
     case animation
     case shortcuts
@@ -19,7 +20,8 @@ private enum AudioDestination: String, CaseIterable, Identifiable {
         case .record: "Record"
         case .overview: "Overview"
         case .history: "Library"
-        case .model: "Model"
+        case .speakers: "Speakers"
+        case .model: "Models"
         case .animation: "Animation"
         case .shortcuts: "Shortcuts"
         }
@@ -30,6 +32,7 @@ private enum AudioDestination: String, CaseIterable, Identifiable {
         case .record: "record.circle"
         case .overview: "square.grid.2x2"
         case .history: "books.vertical"
+        case .speakers: "person.2"
         case .model: "cpu"
         case .animation: "sparkles"
         case .shortcuts: "keyboard"
@@ -156,10 +159,16 @@ struct AudioView: View {
     private var includeSystemAudio = true
     @AppStorage(AudioCapturePreferences.suggestMeetingTranscriptionKey)
     private var suggestMeetingTranscription = false
-    @State private var searchText = ""
+    @State private var libraryFilter = AudioLibraryFilter()
+    @State private var libraryPageIndex = 0
     @State private var editingShortcut: AudioShortcutKind?
     @State private var shortcutConflict: String?
     @State private var destination: AudioDestination = .record
+    @State private var selectedRecordingID: String?
+    @State private var selectedRecordingSection: AudioRecordingSection = .summary
+    @State private var selectedSpeakerProfileID: String?
+    @State private var recordingSourceProfileID: String?
+    @State private var initiallyShowsRecordingSpeakers = false
     @State private var pendingDeleteDictation: AudioTranscriptionRecord?
     @State private var pendingDeleteRecording: AudioTranscriptionRecord?
     @State private var hoveredActivity: AudioDailyUsage?
@@ -214,12 +223,10 @@ struct AudioView: View {
         }
         .onChange(of: inputDevices.selectedDeviceID) { _, _ in
             inputVolume.refresh(deviceUniqueID: inputDevices.effectiveDeviceID)
-            Task {
-                await inputLevelMonitor.start(
-                    deviceUniqueID: inputDevices.effectiveDeviceID
-                )
-            }
+            startInputMonitoringIfNeeded()
         }
+        .onChange(of: inputDevices.exclusions) { startInputMonitoringIfNeeded() }
+        .onChange(of: inputDevices.devices) { startInputMonitoringIfNeeded() }
         .onChange(of: captureLibrary.phase) { _, phase in
             if phase == .idle {
                 startInputMonitoringIfNeeded()
@@ -359,6 +366,12 @@ struct AudioView: View {
                 ForEach(AudioDestination.allCases) { item in
                     Button {
                         withAnimation(.snappy(duration: 0.18)) {
+                            if item == .history || item == .speakers {
+                                selectedRecordingID = nil
+                                selectedSpeakerProfileID = nil
+                                recordingSourceProfileID = nil
+                                initiallyShowsRecordingSpeakers = false
+                            }
                             destination = item
                         }
                     } label: {
@@ -410,20 +423,76 @@ struct AudioView: View {
                 modelUsagePanel
             }
         case .history:
-            AudioPage(
-                title: "Audio Library",
-                subtitle: "Review persistent recordings alongside dictation history"
-            ) {
-                savedCapturesPanel
-                recentDictationsPanel
+            if let record = captureRecords.first(where: { $0.id == selectedRecordingID }) {
+                AudioRecordingDetail(
+                    record: record,
+                    library: captureLibrary,
+                    analytics: analytics,
+                    recognition: captureLibrary.speakerRecognition,
+                    initialSection: selectedRecordingSection,
+                    initialSpeakerProfileID: recordingSourceProfileID,
+                    initialShowsSpeakers: initiallyShowsRecordingSpeakers,
+                    onBack: {
+                        selectedRecordingID = nil
+                        if let profileID = recordingSourceProfileID {
+                            selectedSpeakerProfileID = profileID
+                            destination = .speakers
+                        }
+                        recordingSourceProfileID = nil
+                    },
+                    onRename: { analytics.updateTitle($0, for: record.id) },
+                    onRenameSpeaker: { analytics.updateSpeakerName($1, speakerID: $0, for: record.id) },
+                    onDelete: { pendingDeleteRecording = record },
+                    onOpenSpeakerProfile: { profileID in
+                        selectedSpeakerProfileID = profileID
+                        destination = .speakers
+                    }
+                )
+                .id(record.id + (recordingSourceProfileID ?? "") + String(initiallyShowsRecordingSpeakers))
+            } else {
+                ScrollViewReader { proxy in
+                    AudioPage(
+                        title: "Audio Library",
+                        subtitle: "Find recordings, transcripts and summaries"
+                    ) {
+                        savedCapturesPanel.id("audio-library-results")
+                    }
+                    .onChange(of: libraryPageIndex) { _, _ in
+                        proxy.scrollTo("audio-library-results", anchor: .top)
+                    }
+                }
+            }
+        case .speakers:
+            AudioSpeakerProfilesView(
+                store: analytics, recognition: captureLibrary.speakerRecognition, library: captureLibrary,
+                selectedProfileID: $selectedSpeakerProfileID
+            ) { recordID, profileID in
+                recordingSourceProfileID = profileID
+                initiallyShowsRecordingSpeakers = false
+                selectedRecordingID = recordID
+                selectedRecordingSection = .transcript
+                destination = .history
+            } onReviewMatch: { recordID in
+                recordingSourceProfileID = nil
+                initiallyShowsRecordingSpeakers = true
+                selectedRecordingID = recordID
+                selectedRecordingSection = .summary
+                destination = .history
             }
         case .model:
             AudioPage(
-                title: "Speech-to-Text Model",
-                subtitle: "Choose which installed model handles voice transcription"
+                title: "Audio Models",
+                subtitle: "Transcription and speaker identification for your recordings"
             ) {
                 modelConfigurationPanel
                     .frame(maxWidth: 760)
+                diarizationModelPanel
+                    .frame(maxWidth: 760)
+                AudioSpeakerEmbeddingModelPanel(
+                    token: model.effectiveHuggingFaceToken,
+                    recognition: captureLibrary.speakerRecognition
+                )
+                .frame(maxWidth: 760)
             }
         case .animation:
             AudioPage(
@@ -440,6 +509,8 @@ struct AudioView: View {
                 shortcutConfigurationPanel
                     .frame(maxWidth: 760)
                 wakeWordConfigurationPanel
+                    .frame(maxWidth: 760)
+                excludedMicrophonesPanel
                     .frame(maxWidth: 760)
                 spokenReturnConfigurationPanel
                     .frame(maxWidth: 760)
@@ -1118,10 +1189,16 @@ struct AudioView: View {
                     }
 
                     ForEach(inputDevices.devices) { device in
+                        let exclusion = inputDevices.exclusions.first { $0.id == device.id }
+                        let exclusionDescription = exclusion.map {
+                            $0.allUses ? "Excluded from all microphone use" : "Excluded from passive listening"
+                        } ?? ""
                         Button {
                             inputDevices.selectedDeviceID = device.id
                         } label: {
-                            if inputDevices.selectedDeviceID == device.id {
+                            if exclusion != nil {
+                                Label(device.isSystemDefault ? "\(device.name) (Default)" : device.name, systemImage: "mic.slash")
+                            } else if inputDevices.selectedDeviceID == device.id {
                                 Label(device.name, systemImage: "checkmark")
                             } else if device.isSystemDefault {
                                 Text("\(device.name) (Default)")
@@ -1129,6 +1206,9 @@ struct AudioView: View {
                                 Text(device.name)
                             }
                         }
+                        .disabled(exclusion?.allUses == true)
+                        .help(exclusionDescription)
+                        .accessibilityHint(exclusionDescription)
                     }
                 } label: {
                     HStack(spacing: 8) {
@@ -1211,7 +1291,7 @@ struct AudioView: View {
                     Spacer(minLength: 0)
                 }
 
-                if let errorMessage = inputLevelMonitor.errorMessage {
+                if let errorMessage = audioInputErrorMessage {
                     Text(errorMessage)
                         .font(.caption)
                         .foregroundStyle(.orange)
@@ -1576,8 +1656,10 @@ struct AudioView: View {
         case .processing:
             "Processing"
         case .idle:
-            if inputLevelMonitor.errorMessage != nil {
+            if audioInputErrorMessage != nil {
                 "Unavailable"
+            } else if inputDevices.passiveDeviceID == nil {
+                "Preview off"
             } else if inputLevelMonitor.isMonitoring {
                 "Input active"
             } else {
@@ -1586,11 +1668,18 @@ struct AudioView: View {
         }
     }
 
+    private var audioInputErrorMessage: String? {
+        guard inputDevices.effectiveDeviceID != nil else {
+            return VoiceAudioRecorderError.noAllowedMicrophone.localizedDescription
+        }
+        return inputDevices.passiveDeviceID == nil ? nil : inputLevelMonitor.errorMessage
+    }
+
     private var audioInputStatusColor: Color {
         if captureLibrary.phase == .recording {
             return .red
         }
-        if inputLevelMonitor.errorMessage != nil {
+        if audioInputErrorMessage != nil {
             return .orange
         }
         return inputLevelMonitor.isMonitoring ? .green : .secondary
@@ -1684,36 +1773,14 @@ struct AudioView: View {
 
     private var modelConfigurationPanel: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "waveform.badge.mic")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(Color.accentColor)
-                    .frame(width: 36, height: 36)
-                    .background(
-                        Color.accentColor.opacity(0.12),
-                        in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    )
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Transcription Model")
-                        .font(.headline)
-                    Text("This model handles voice dictation everywhere you use Nativ.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Divider()
-                .padding(.vertical, 18)
-
             VStack(alignment: .leading, spacing: 8) {
-                Text("Model selection")
+                Text("Transcription model")
                     .font(.subheadline.weight(.semibold))
-                Text("Choose a specific installed model, or let Nativ pick the first compatible one.")
+                Text("Choose an installed model, or use Automatic for built-in transcription on macOS 27 and later.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                if localLibrary.isScanning && speechModels.isEmpty {
+                if localLibrary.isScanning && speechModels.isEmpty && !DefaultSpeechModel.isSupported {
                     HStack(spacing: 7) {
                         ProgressView().controlSize(.small)
                         Text("Scanning installed models…")
@@ -1771,10 +1838,6 @@ struct AudioView: View {
                 if model.modelSwitchInProgress {
                     ProgressView()
                         .controlSize(.small)
-                } else {
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
                 }
             }
             .padding(.horizontal, 4)
@@ -1786,9 +1849,49 @@ struct AudioView: View {
         .disabled(model.modelSwitchInProgress)
     }
 
+    private var diarizationModelPanel: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Label("Speaker diarization", systemImage: "person.2.wave.2")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Text("Default").font(.caption.weight(.medium))
+                    .padding(.horizontal, 9).padding(.vertical, 4)
+                    .background(Color.accentColor.opacity(0.1), in: Capsule())
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Nemotron 3 Diarization").font(.headline)
+                Text(MeetingDiarizer.defaultModelID)
+                    .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                Text("Identifies speakers across the entire recording before transcription. Speaker IDs stay consistent throughout long recordings.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            Divider()
+            HStack(alignment: .top) {
+                Label("Runs locally · Downloads on first use", systemImage: "desktopcomputer")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Link("View model", destination: URL(string: "https://huggingface.co/\(MeetingDiarizer.defaultModelID)")!)
+                    .font(.caption)
+            }
+        }
+        .padding(20)
+        .audioPanelStyle()
+    }
+
     @ViewBuilder
     private var speechModelStatus: some View {
-        if speechModels.isEmpty && !localLibrary.isScanning {
+        if DefaultSpeechModel.isPreferred(selectedModelID: selectedModelID) {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Parakeet Redux", systemImage: "checkmark.circle.fill")
+                    .font(.callout.weight(.medium))
+                Text("Built into Nativ and transcribes in the app.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } else if speechModels.isEmpty && !localLibrary.isScanning {
             HStack(alignment: .center, spacing: 12) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
@@ -2581,10 +2684,23 @@ struct AudioView: View {
             Text("Say “hey nativ” and continue speaking. Pause for two seconds to transcribe, or use your dictation shortcut to finish.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text("Keeps your selected microphone active and a short audio history in memory. Your local speech model confirms the wake phrase, so the Nativ server must be running.")
+            Text("Keeps your selected microphone active and a short audio history in memory. Your local speech model confirms the wake phrase.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             if shortcuts.isWakeWordEnabled {
+                Picker("Listening mode", selection: $shortcuts.wakeWordListeningMode) {
+                    ForEach(VoiceWakeWordListeningMode.allCases, id: \.self) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                if shortcuts.wakeWordListeningMode == .automatic {
+                    Text("On battery, pauses after 5 minutes without keyboard, mouse, or dictation activity—or 1 minute in Low Power Mode. A successful dictation keeps listening available for at least 10 minutes. Stays ready while plugged in.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("While paused, move the mouse, press a key, or use your dictation shortcut to resume. Saying “hey nativ” cannot resume a paused microphone.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 HStack {
                     Text(wakeWordMonitor.state.description)
                         .font(.caption)
@@ -2599,6 +2715,59 @@ struct AudioView: View {
         .fixedSize(horizontal: false, vertical: true)
         .padding(18)
         .audioPanelStyle()
+    }
+
+    private var excludedMicrophonesPanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("Excluded Microphones", systemImage: "mic.slash")
+                    .font(.headline)
+                Spacer()
+                Menu("Add Microphone") {
+                    ForEach(excludableDevices) { device in
+                        Button(device.name) { inputDevices.exclude(device) }
+                    }
+                }
+                .fixedSize()
+                .disabled(excludableDevices.isEmpty)
+            }
+            Text("These microphones are skipped for Hey Nativ and input previews. Nativ uses another available microphone, or pauses passive listening if none are allowed.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ForEach(inputDevices.exclusions) { exclusion in
+                let device = inputDevices.devices.first { $0.id == exclusion.id }
+                Divider()
+                HStack(spacing: 16) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(device?.name ?? exclusion.name)
+                            .font(.callout.weight(.medium))
+                        if device == nil {
+                            Text("Disconnected")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Toggle("Exclude from all microphone use", isOn: Binding(
+                            get: { exclusion.allUses },
+                            set: { inputDevices.setExcludedFromAllUses($0, id: exclusion.id) }
+                        ))
+                        .toggleStyle(.checkbox)
+                    }
+                    Spacer()
+                    Button("Remove") { inputDevices.removeExclusion(id: exclusion.id) }
+                        .accessibilityLabel("Remove exclusion for \(device?.name ?? exclusion.name)")
+                }
+            }
+            Text("Exclusions are remembered when a microphone reconnects and only apply within Nativ.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .disabled(captureLibrary.isBusy)
+        .padding(18)
+        .audioPanelStyle()
+    }
+
+    private var excludableDevices: [NativAudioInputDevice] {
+        inputDevices.devices.filter { device in !inputDevices.exclusions.contains { $0.id == device.id } }
     }
 
     private var spokenReturnConfigurationPanel: some View {
@@ -2652,71 +2821,15 @@ struct AudioView: View {
         .audioPanelStyle()
     }
 
-    private var recentDictationsPanel: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Recent Dictations")
-                        .font(.headline)
-                    Text("Search and reuse transcripts stored locally.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button("Clear All", role: .destructive) {
-                    isConfirmingClearAllDictations = true
-                }
-                .buttonStyle(.plain)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.red)
-                .disabled(dictationRecords.isEmpty)
-                .help("Delete all recent dictations")
-
-                TextField("Search transcripts", text: $searchText)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 240)
-            }
-
-            if filteredRecords.isEmpty {
-                ContentUnavailableView {
-                    Label(
-                        searchText.isEmpty ? "No transcripts yet" : "No matching transcripts",
-                        systemImage: searchText.isEmpty ? "text.badge.plus" : "magnifyingglass"
-                    )
-                } description: {
-                    Text(
-                        searchText.isEmpty
-                            ? "Your completed voice dictations will appear here."
-                            : "Try a different search."
-                    )
-                }
-                .frame(maxWidth: .infinity, minHeight: 160)
-            } else {
-                VStack(spacing: 0) {
-                    ForEach(Array(filteredRecords.prefix(30).enumerated()), id: \.element.id) {
-                        index, record in
-                        AudioTranscriptRow(
-                            record: record,
-                            onDelete: { pendingDeleteDictation = record }
-                        )
-                        if index < min(filteredRecords.count, 30) - 1 {
-                            Divider()
-                        }
-                    }
-                }
-            }
-        }
-        .padding(18)
-        .audioPanelStyle()
-    }
-
     private var savedCapturesPanel: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        let matches = libraryFilter.records(in: analytics.records, profiles: analytics.speakerProfiles)
+        let page = AudioLibraryPage(records: matches, index: libraryPageIndex)
+        return VStack(alignment: .leading, spacing: 14) {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Recordings")
+                    Text(libraryFilter.kind.title)
                         .font(.headline)
-                    Text("Persistent audio, raw transcripts, and local summaries.")
+                    Text("Search transcripts, summaries and speaker names.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -2736,44 +2849,45 @@ struct AudioView: View {
                 .controlSize(.small)
             }
 
-            if captureRecords.isEmpty {
+            AudioLibraryControls(filter: $libraryFilter, profiles: analytics.speakerProfiles)
+            AudioLibraryPagination(page: page, selection: $libraryPageIndex)
+            if libraryFilter.kind == .dictations {
+                HStack {
+                    Spacer()
+                    Button("Clear all dictations", role: .destructive) { isConfirmingClearAllDictations = true }
+                        .font(.caption).disabled(dictationRecords.isEmpty)
+                }
+            }
+            if matches.isEmpty {
                 ContentUnavailableView {
-                    Label("No saved recordings", systemImage: "waveform.badge.plus")
+                    Label("No matching recordings", systemImage: "magnifyingglass")
                 } description: {
-                    Text("Start a recording to create your local audio library.")
-                } actions: {
-                    Button("Start Recording") {
-                        destination = .record
-                    }
-                    .buttonStyle(.borderedProminent)
+                    Text("Try another search or clear the filters.")
                 }
                 .frame(maxWidth: .infinity, minHeight: 170)
             } else {
-                LazyVStack(spacing: 10) {
-                    ForEach(captureRecords) { record in
-                        AudioCaptureRecordRow(
-                            record: record,
-                            audioIsAvailable: captureLibrary.audioURL(for: record) != nil,
-                            isProcessing: captureLibrary.processingRecordIDs.contains(record.id),
-                            isTranscribing: captureLibrary.transcribingRecordIDs.contains(record.id),
-                            isPlaying: captureLibrary.playingRecordID == record.id
-                                && !captureLibrary.isPlaybackPaused,
-                            isPaused: captureLibrary.playingRecordID == record.id
-                                && captureLibrary.isPlaybackPaused,
-                            onPlay: { captureLibrary.togglePlayback(for: record) },
-                            onStop: { captureLibrary.stopPlayback() },
-                            onReveal: { captureLibrary.revealAudio(for: record) },
-                            onTranscribe: { captureLibrary.retryTranscription(record) },
-                            onSummarize: { captureLibrary.summarize(record) },
-                            onRename: { analytics.updateTitle($0, for: record.id) },
-                            onDelete: { pendingDeleteRecording = record }
-                        )
-                    }
-                }
+                AudioLibraryRecordings(records: page.records, profiles: analytics.speakerProfiles,
+                    library: captureLibrary,
+                    onOpen: { record, section in
+                        recordingSourceProfileID = nil
+                        initiallyShowsRecordingSpeakers = false
+                        selectedRecordingSection = section
+                        selectedRecordingID = record.id
+                    },
+                    onRename: { record, title in analytics.updateTitle(title, for: record.id) },
+                    onDelete: { record in
+                        if record.resolvedKind == .dictation { pendingDeleteDictation = record }
+                        else { pendingDeleteRecording = record }
+                    })
+                AudioLibraryPagination(page: page, selection: $libraryPageIndex, identifier: "audio.library.footer")
             }
         }
         .padding(18)
         .audioPanelStyle()
+        .onChange(of: libraryFilter) { _, _ in libraryPageIndex = 0 }
+        .onChange(of: matches.map(\.id)) { _, _ in
+            libraryPageIndex = AudioLibraryPage(records: matches, index: libraryPageIndex).index
+        }
     }
 
     private func chooseAudioToImport() {
@@ -2885,18 +2999,6 @@ struct AudioView: View {
         hoveredActivity = nextActivity
     }
 
-    private var filteredRecords: [AudioTranscriptionRecord] {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else {
-            return dictationRecords
-        }
-        return dictationRecords.filter { record in
-            record.transcript.localizedCaseInsensitiveContains(query)
-                || record.applicationName?.localizedCaseInsensitiveContains(query) == true
-                || record.modelID?.localizedCaseInsensitiveContains(query) == true
-        }
-    }
-
     private var dictationRecords: [AudioTranscriptionRecord] {
         analytics.records.filter { $0.resolvedKind == .dictation }
     }
@@ -2970,7 +3072,7 @@ struct AudioView: View {
             refreshLocalModels()
         case .overview, .history:
             importExistingTranscripts()
-        case .animation, .shortcuts:
+        case .animation, .shortcuts, .speakers:
             break
         }
     }
@@ -2987,7 +3089,7 @@ struct AudioView: View {
         case .overview, .history:
             importExistingTranscripts()
             inputLevelMonitor.stop()
-        case .animation, .shortcuts:
+        case .animation, .shortcuts, .speakers:
             inputLevelMonitor.stop()
         }
     }
@@ -3000,9 +3102,13 @@ struct AudioView: View {
         guard destination == .record, captureLibrary.phase == .idle else {
             return
         }
+        guard inputDevices.passiveDeviceID != nil else {
+            inputLevelMonitor.stop()
+            return
+        }
         Task {
             await inputLevelMonitor.start(
-                deviceUniqueID: inputDevices.effectiveDeviceID
+                deviceUniqueID: inputDevices.selectedDeviceID
             )
         }
     }
@@ -3026,7 +3132,8 @@ struct AudioView: View {
         analytics.deleteAllDictations(
             recordingsDirectory: try? VoiceAudioRecorder.recordingsDirectory
         )
-        searchText = ""
+        libraryFilter.query = ""
+        libraryPageIndex = 0
     }
 
     private func apply(_ shortcut: VoiceShortcut, to kind: AudioShortcutKind) {
@@ -3249,7 +3356,7 @@ private struct AudioTitleDoubleClickTarget: NSViewRepresentable {
     }
 }
 
-private struct InlineEditableAudioTitle: View {
+struct InlineEditableAudioTitle: View {
     let title: String
     let placeholder: String
     let font: Font
@@ -3334,7 +3441,7 @@ private struct InlineEditableAudioTitle: View {
     }
 }
 
-private struct AudioTranscriptRow: View {
+struct AudioTranscriptRow: View {
     let record: AudioTranscriptionRecord
     let onDelete: () -> Void
     @State private var copied = false
@@ -3343,7 +3450,7 @@ private struct AudioTranscriptRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 14) {
             VStack(alignment: .leading, spacing: 7) {
-                Text(record.transcript)
+                Text(record.displayTranscript)
                     .font(.callout)
                     .lineLimit(3)
                     .textSelection(.enabled)
@@ -3375,7 +3482,7 @@ private struct AudioTranscriptRow: View {
             HStack(spacing: 4) {
                 Button {
                     NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(record.transcript, forType: .string)
+                    NSPasteboard.general.setString(record.displayTranscript, forType: .string)
                     copied = true
                     Task {
                         try? await Task.sleep(for: .seconds(1.5))
@@ -3419,8 +3526,9 @@ private struct AudioTranscriptRow: View {
     }
 }
 
-private func audioTranscriptionModelDisplayName(_ modelID: String) -> String {
-    modelID.split(separator: "/").last.map(String.init) ?? modelID
+func audioTranscriptionModelDisplayName(_ modelID: String) -> String {
+    if modelID == DefaultSpeechModel.identifier { return "Parakeet Redux" }
+    return modelID.split(separator: "/").last.map(String.init) ?? modelID
 }
 
 private struct AudioTranscriptionModelProviderBadge: View {
@@ -3483,409 +3591,7 @@ private struct AudioTranscriptionModelMetadata: View {
         )
             .lineLimit(1)
             .help("Transcribed with \(modelID)")
-            .accessibilityLabel("Transcription model \(modelID)")
     }
-}
-
-private struct AudioCaptureRecordRow: View {
-    let record: AudioTranscriptionRecord
-    let audioIsAvailable: Bool
-    let isProcessing: Bool
-    let isTranscribing: Bool
-    let isPlaying: Bool
-    let isPaused: Bool
-    let onPlay: () -> Void
-    let onStop: () -> Void
-    let onReveal: () -> Void
-    let onTranscribe: () -> Void
-    let onSummarize: () -> Void
-    let onRename: (String) -> Void
-    let onDelete: () -> Void
-
-    @State private var selectedDetail: DetailSection?
-    @State private var copiedDetail: DetailSection?
-    @State private var hoveredDetail: DetailSection?
-
-    private enum DetailSection: Hashable {
-        case summary
-        case transcript
-
-        var title: String {
-            switch self {
-            case .summary: "Summary"
-            case .transcript: "Transcript"
-            }
-        }
-
-        var systemImage: String {
-            switch self {
-            case .summary: "sparkles"
-            case .transcript: "text.alignleft"
-            }
-        }
-
-        var tint: Color {
-            switch self {
-            case .summary: .primary
-            case .transcript: .primary
-            }
-        }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: record.resolvedKind.systemImage)
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(record.resolvedKind == .dictation ? Color.secondary : Color.blue)
-                    .frame(width: 36, height: 36)
-                    .background(
-                        (record.resolvedKind == .dictation ? Color.secondary : Color.blue)
-                            .opacity(0.11),
-                        in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    )
-
-                VStack(alignment: .leading, spacing: 4) {
-                    InlineEditableAudioTitle(
-                        title: record.displayTitle,
-                        placeholder: "\(record.resolvedKind.title) title",
-                        font: .callout.weight(.semibold),
-                        onRename: onRename
-                    )
-                    HStack(spacing: 7) {
-                        Text(record.resolvedKind.title)
-                        Text("·")
-                        Text(record.recordedAt.formatted(date: .abbreviated, time: .shortened))
-                        if let duration = record.durationSeconds {
-                            Text("·")
-                            Text(NativFormatting.clockDuration(duration))
-                        }
-                        if !record.transcript.isEmpty {
-                            Text("·")
-                            Text("\(record.wordCount) words")
-                        }
-                        if let modelID = record.modelID, !modelID.isEmpty {
-                            Text("·")
-                            AudioTranscriptionModelMetadata(modelID: modelID)
-                        }
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-
-                Spacer(minLength: 12)
-
-                if isProcessing {
-                    HStack(spacing: 7) {
-                        ProgressView().controlSize(.small)
-                        Text(processingLabel)
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-
-                Button(action: onPlay) {
-                    Label(
-                        isPlaying ? "Pause" : (isPaused ? "Resume" : "Play"),
-                        systemImage: isPlaying ? "pause.fill" : "play.fill"
-                    )
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(!audioIsAvailable)
-
-                if isPlaying || isPaused {
-                    Button(action: onStop) {
-                        Label("Stop", systemImage: "stop.fill")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .labelStyle(.iconOnly)
-                    .help("Stop playback")
-                }
-
-                if record.transcript.isEmpty && !isProcessing {
-                    Button("Transcribe", action: onTranscribe)
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                        .disabled(!audioIsAvailable)
-                }
-
-                Menu {
-                    if !record.transcript.isEmpty {
-                        Menu {
-                            Button(action: onTranscribe) {
-                                Label("Transcript", systemImage: "text.alignleft")
-                            }
-                            .disabled(!audioIsAvailable || isProcessing)
-
-                            Button(action: onSummarize) {
-                                Label("Summary", systemImage: "sparkles")
-                            }
-                            .disabled(isProcessing)
-                        } label: {
-                            Label("Regenerate", systemImage: "arrow.clockwise")
-                        }
-                        Divider()
-                        Button("Copy Transcript", action: copyTranscript)
-                        if let summary = record.summary, !summary.isEmpty {
-                            Button("Copy Summary") {
-                                copy(summary, detail: .summary)
-                            }
-                        }
-                    }
-                    Divider()
-                    Button("Reveal in Finder", action: onReveal)
-                        .disabled(!audioIsAvailable)
-                    Button("Delete Recording", role: .destructive, action: onDelete)
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .frame(width: 18)
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-            }
-
-            if !record.transcript.isEmpty {
-                VStack(spacing: 0) {
-                    detailMenu
-
-                    if let selectedDetail {
-                        Divider()
-                            .padding(.horizontal, 12)
-
-                        detailContent(selectedDetail)
-                            .transition(.opacity)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.primary.opacity(0.032), in: RoundedRectangle(cornerRadius: 11))
-                .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
-                }
-            }
-
-            if record.transcript.isEmpty && !isProcessing {
-                Label(
-                    "Audio saved without a transcript. You can keep or delete the recording.",
-                    systemImage: "exclamationmark.circle"
-                )
-                .font(.caption)
-                .foregroundStyle(.orange)
-            }
-        }
-        .padding(14)
-        .background(
-            Color.primary.opacity(0.025),
-            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.primary.opacity(0.07), lineWidth: 1)
-        }
-    }
-
-    private var processingLabel: String {
-        if isTranscribing {
-            return record.transcript.isEmpty ? "Transcribing" : "Regenerating transcript"
-        }
-        return "Summarizing"
-    }
-
-    private var detailMenu: some View {
-        HStack(spacing: 5) {
-            detailButton(.summary)
-            detailButton(.transcript)
-            Spacer(minLength: 8)
-
-            if selectedDetail != nil {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        selectedDetail = nil
-                    }
-                } label: {
-                    Image(systemName: "chevron.up")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 28, height: 28)
-                        .background(Color.primary.opacity(0.05), in: Circle())
-                }
-                .buttonStyle(.plain)
-                .help("Collapse details")
-            }
-        }
-        .padding(6)
-    }
-
-    private func detailButton(_ detail: DetailSection) -> some View {
-        let isSelected = selectedDetail == detail
-        let isHovered = hoveredDetail == detail
-        return Button {
-            withAnimation(.easeInOut(duration: 0.18)) {
-                selectedDetail = isSelected ? nil : detail
-            }
-        } label: {
-            HStack(spacing: 7) {
-                Image(systemName: detail.systemImage)
-                    .font(.caption.weight(.semibold))
-
-                Text(detail.title)
-                    .font(.callout.weight(.semibold))
-
-                if detail == .summary, record.summary?.isEmpty != false {
-                    Text(isProcessing ? "Working" : "Create")
-                        .font(.caption2.weight(.semibold))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(
-                            (isSelected ? Color.white : Color.purple).opacity(0.14),
-                            in: Capsule()
-                        )
-                } else if detail == .transcript {
-                    Text(record.wordCount.formatted())
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(
-                            isSelected ? Color.white.opacity(0.78) : Color.primary.opacity(0.42)
-                        )
-                }
-            }
-            .foregroundStyle(isSelected ? Color.white : detail.tint)
-            .padding(.horizontal, 11)
-            .frame(height: 32)
-            .background(
-                isSelected
-                    ? Color.accentColor
-                    : (isHovered ? Color.primary.opacity(0.06) : Color.clear),
-                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering in
-            withAnimation(.easeOut(duration: 0.12)) {
-                hoveredDetail = hovering ? detail : nil
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func detailContent(_ detail: DetailSection) -> some View {
-        switch detail {
-        case .summary:
-            if let summary = record.summary, !summary.isEmpty {
-                VStack(alignment: .leading, spacing: 10) {
-                    detailHeader(
-                        title: "AI-Generated Notes",
-                        detail: .summary,
-                        text: summary
-                    )
-
-                    ScrollView {
-                        MarkdownRenderer(
-                            content: MathPreprocessor.preprocess(summary),
-                            fontSize: NSFont.preferredFont(forTextStyle: .callout).pointSize
-                        )
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .frame(maxHeight: 360)
-                }
-                .padding(14)
-            } else {
-                HStack(spacing: 12) {
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(.purple)
-                        .frame(width: 34, height: 34)
-                        .background(Color.purple.opacity(0.1), in: Circle())
-
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(isProcessing ? "Creating your summary" : "Create a concise summary")
-                            .font(.callout.weight(.semibold))
-                        Text("Turn this transcript into structured notes, decisions, and action items.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Spacer(minLength: 12)
-
-                    if isProcessing {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Button("Generate", action: onSummarize)
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-                    }
-                }
-                .padding(14)
-            }
-
-        case .transcript:
-            VStack(alignment: .leading, spacing: 10) {
-                detailHeader(
-                    title: "Verbatim transcript · \(record.wordCount.formatted()) words",
-                    detail: .transcript,
-                    text: record.transcript
-                )
-
-                ScrollView {
-                    Text(record.transcript)
-                        .font(.body)
-                        .foregroundStyle(Color.primary.opacity(0.82))
-                        .lineSpacing(4)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxHeight: 320)
-            }
-            .padding(14)
-        }
-    }
-
-    private func detailHeader(
-        title: String,
-        detail: DetailSection,
-        text: String
-    ) -> some View {
-        HStack(spacing: 8) {
-            Text(title)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
-
-            Spacer(minLength: 8)
-
-            Button {
-                copy(text, detail: detail)
-            } label: {
-                Label(
-                    copiedDetail == detail ? "Copied" : "Copy",
-                    systemImage: copiedDetail == detail ? "checkmark" : "doc.on.doc"
-                )
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.mini)
-        }
-    }
-
-    private func copyTranscript() {
-        copy(record.transcript, detail: .transcript)
-    }
-
-    private func copy(_ text: String, detail: DetailSection) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
-        copiedDetail = detail
-        Task {
-            try? await Task.sleep(for: .seconds(1.5))
-            if copiedDetail == detail {
-                copiedDetail = nil
-            }
-        }
-    }
-
 }
 
 private struct ShortcutCaptureSheet: View {
@@ -4020,6 +3726,109 @@ private final class ShortcutRecorderNSView: NSView {
         )
         onPreview?(shortcut.displayName)
         onCapture?(shortcut)
+    }
+}
+
+@MainActor
+private struct AudioSpeakerEmbeddingModelPanel: View {
+    let token: String?
+    @ObservedObject var recognition: AudioSpeakerRecognition
+    @ObservedObject private var downloads = HuggingFaceDownloadManager.shared
+    @State private var isInstalled: Bool?
+    @State private var refreshID = UUID()
+
+    private var modelID: String { AudioSpeakerEmbeddingModel.repoID }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Label("Speaker embeddings", systemImage: "person.wave.2")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Text("Default").font(.caption.weight(.medium))
+                    .padding(.horizontal, 9).padding(.vertical, 4)
+                    .background(Color.accentColor.opacity(0.1), in: Capsule())
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text(AudioSpeakerEmbeddingModel.title).font(.headline)
+                Text(modelID)
+                    .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                Text("Recognizes recurring voices across meetings and keeps speaker profiles up to date. Runs locally on your Mac.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            Divider()
+            HStack(spacing: 12) {
+                downloadStatus
+                Spacer(minLength: 8)
+                Link("View model", destination: URL(string: "https://huggingface.co/\(modelID)")!)
+                    .font(.caption)
+            }
+            if let error = downloads.errorByModelID[modelID] {
+                Text(error.localizedDescription).font(.caption).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(20)
+        .audioPanelStyle()
+        .accessibilityIdentifier("audio-models.speaker-embeddings")
+        .task(id: refreshID) {
+            isInstalled = nil
+            let cachePath = AudioSpeakerEmbeddingModel.cachePath
+            let installed = await Task.detached(priority: .utility) {
+                AudioSpeakerEmbeddingModel.isInstalled(cachePath: cachePath)
+            }.value
+            guard !Task.isCancelled else { return }
+            isInstalled = installed
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .localModelLibraryDidChange)) { _ in
+            refreshID = UUID()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshID = UUID()
+        }
+        .onChange(of: recognition.processingProfileIDs) { _, ids in
+            if ids.isEmpty { refreshID = UUID() }
+        }
+        .onChange(of: recognition.processingRecordIDs) { _, ids in
+            if ids.isEmpty { refreshID = UUID() }
+        }
+    }
+
+    @ViewBuilder
+    private var downloadStatus: some View {
+        if downloads.isDownloading(modelID) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(downloads.isPaused(for: modelID) ? "Download paused" : "Downloading speaker model…")
+                    .font(.caption).foregroundStyle(.secondary)
+                ProgressView(value: downloads.progress(for: modelID)).frame(width: 170)
+            }
+            Button(downloads.isPaused(for: modelID) ? "Resume" : "Pause") {
+                if downloads.isPaused(for: modelID) {
+                    downloads.resumeDownload(modelID)
+                } else {
+                    downloads.pauseDownload(modelID)
+                }
+            }
+            .buttonStyle(.bordered).controlSize(.small)
+        } else if isInstalled == true {
+            Label("Downloaded · 42 MB", systemImage: "checkmark.circle.fill")
+                .font(.caption).foregroundStyle(.secondary)
+        } else if isInstalled == nil {
+            ProgressView().controlSize(.small)
+            Text("Checking model download…").font(.caption).foregroundStyle(.secondary)
+        } else {
+            Text("42 MB · Downloads on first use")
+                .font(.caption).foregroundStyle(.secondary)
+            Button("Download") {
+                downloads.download(
+                    repoID: modelID, sizeBytes: AudioSpeakerEmbeddingModel.estimatedSizeBytes,
+                    cachePath: AudioSpeakerEmbeddingModel.cachePath,
+                    volumeIdentifier: nil, token: token
+                ) { refreshID = UUID() }
+            }
+            .buttonStyle(.bordered).controlSize(.small)
+            .accessibilityIdentifier("audio-models.download-speaker-embeddings")
+        }
     }
 }
 

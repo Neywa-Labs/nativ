@@ -288,6 +288,7 @@ struct ModelsView: View {
         ModelConfigurationLayoutContent(
             settings: settingsBinding,
             settingsRequireRestart: model.settingsRequireRestart,
+            runtimeSettings: model.runtimeSettings,
             isConfigurationVisible: $showsConfiguration,
             onReset: model.resetSettings
         ) {
@@ -296,6 +297,7 @@ struct ModelsView: View {
                 activeDownloadBanner
                 modelLoadFailureBanner
                 externalModelCacheBanner
+                runtimeConfigurationBanner
 
                 modelsPage
             }
@@ -385,14 +387,7 @@ struct ModelsView: View {
             let searchTaskID = hubSearchTaskID
             guard searchTaskID != lastStartedHubSearchTaskID else { return }
             lastStartedHubSearchTaskID = searchTaskID
-            hubLibrary.search(
-                query: searchQuery,
-                sort: hubSort,
-                direction: hubSortDirection,
-                capabilities: hubCapabilityFilters,
-                predicate: hubVisibilityPredicate,
-                token: modelState.effectiveHuggingFaceToken
-            )
+            searchHub()
         }
         .task(id: readmeSelection?.repoID) {
             guard let readmeSelection else {
@@ -473,6 +468,21 @@ struct ModelsView: View {
         hubSortDirection = .descending
         hubCapabilityFilters = [.drafter]
         hubAccessFilter = .all
+    }
+
+    @ViewBuilder
+    private var runtimeConfigurationBanner: some View {
+        if let error = ModelPrimaryTaskResolver.runtimeConfigurationError {
+            ModelsNotice(
+                title: "Model runtime needs repair",
+                message: error,
+                systemImage: "exclamationmark.triangle.fill",
+                color: .orange
+            )
+            .padding(.horizontal, 22)
+            .padding(.vertical, 10)
+            Divider()
+        }
     }
 
     @ViewBuilder
@@ -734,6 +744,7 @@ struct ModelsView: View {
                 )
                 InstalledModelRow(
                     localModel: localModel,
+                    runtimeConfigurationError: ModelPrimaryTaskResolver.runtimeConfigurationError,
                     preloadSlots: preloadSlots,
                     selectedPreloadSlots: selectedSlots,
                     preferredPreloadSlot: preferredPreloadSlot(
@@ -863,6 +874,17 @@ struct ModelsView: View {
         .accessibilityLabel("Refresh installed models")
     }
 
+    private func searchHub() {
+        hubLibrary.search(
+            query: searchQuery,
+            sort: hubSort,
+            direction: hubSortDirection,
+            capabilities: hubCapabilityFilters,
+            predicate: hubVisibilityPredicate,
+            token: modelState.effectiveHuggingFaceToken
+        )
+    }
+
     @ViewBuilder
     private func discoverScroller() -> some View {
         if let error = hubLibrary.error {
@@ -871,7 +893,8 @@ struct ModelsView: View {
                     title: "Hugging Face Hub is unavailable",
                     message: error,
                     systemImage: "wifi.exclamationmark",
-                    color: .orange
+                    color: .orange,
+                    onRetry: searchHub
                 )
                 .modelsListRow()
             }
@@ -1066,8 +1089,7 @@ struct ModelsView: View {
 
     private func preloadSlots(for localModel: LocalModel) -> [ModelPreloadSlot] {
         var slots: [ModelPreloadSlot] = []
-        if localModel.capabilities.contains(.text)
-            && !localModel.capabilities.contains(.reranking) {
+        if localModel.isEligibleForLanguageModelPicker {
             slots.append(.language)
         }
         if localModel.capabilities.contains(.imageGeneration) {
@@ -1423,7 +1445,7 @@ struct ModelsView: View {
         let capabilities = hubCapabilityFilters
         let access = hubAccessFilter
         return { hubModel in
-            guard !hubModel.isGGUF else { return false }
+            guard !hubModel.isGGUFOnly else { return false }
             let matchesCapability = HuggingFaceCapabilityFilter.matches(
                 hubModel,
                 capabilities: capabilities
@@ -1840,6 +1862,7 @@ private struct ModelReadmePanel: View {
 
 private struct InstalledModelRow: View, @MainActor Equatable {
     let localModel: LocalModel
+    let runtimeConfigurationError: String?
     let preloadSlots: [ModelPreloadSlot]
     let selectedPreloadSlots: Set<ModelPreloadSlot>
     let preferredPreloadSlot: ModelPreloadSlot?
@@ -1864,6 +1887,7 @@ private struct InstalledModelRow: View, @MainActor Equatable {
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.localModel == rhs.localModel
+            && lhs.runtimeConfigurationError == rhs.runtimeConfigurationError
             && lhs.preloadSlots == rhs.preloadSlots
             && lhs.selectedPreloadSlots == rhs.selectedPreloadSlots
             && lhs.preferredPreloadSlot == rhs.preferredPreloadSlot
@@ -1939,7 +1963,9 @@ private struct InstalledModelRow: View, @MainActor Equatable {
                                     color: .orange
                                 )
                             }
-                            if localModel.capabilities.contains(.imageEditing)
+                            if runtimeConfigurationError != nil {
+                                ModelPill(title: "Support unknown", systemImage: "questionmark.circle")
+                            } else if localModel.capabilities.contains(.imageEditing)
                                 && !localModel.capabilities.contains(.imageGeneration)
                             {
                                 ModelPill(
@@ -2036,12 +2062,12 @@ private struct InstalledModelRow: View, @MainActor Equatable {
                 action: onTogglePin
             )
         }
-        .alert("Model isn’t supported", isPresented: $showsUnsupportedModelInformation) {
+        .alert(runtimeConfigurationError == nil ? "Model isn’t supported" : "Model runtime needs repair", isPresented: $showsUnsupportedModelInformation) {
             Button("OK", role: .cancel) {}
                 .keyboardShortcut(.defaultAction)
         } message: {
             Text(
-                "\(localModel.repoID) is installed in your Hugging Face cache, but Nativ can’t use it for chat, image generation, text-to-speech, or speech-to-text."
+                runtimeConfigurationError ?? "\(localModel.repoID) is installed in your Hugging Face cache, but Nativ can’t use it for chat, image generation, text-to-speech, or speech-to-text."
             )
         }
         .alert("Delete \(modelName(localModel.repoID))?", isPresented: $showsDeleteConfirmation) {
@@ -2121,7 +2147,7 @@ private struct InstalledModelRow: View, @MainActor Equatable {
 
     @ViewBuilder
     private var loadButton: some View {
-        if let preferredPreloadSlot {
+        if let preferredPreloadSlot, runtimeConfigurationError == nil {
             let isLoaded = selectedPreloadSlots.contains(preferredPreloadSlot)
             Button {
                 guard !isSelectionDisabled else { return }
@@ -2146,7 +2172,7 @@ private struct InstalledModelRow: View, @MainActor Equatable {
             Button {
                 showsUnsupportedModelInformation = true
             } label: {
-                Label("Unavailable", systemImage: "exclamationmark.triangle")
+                Label(runtimeConfigurationError == nil ? "Unavailable" : "Runtime error", systemImage: "exclamationmark.triangle")
                     .font(.callout.weight(.medium))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 10)
@@ -2163,6 +2189,7 @@ private struct InstalledModelRow: View, @MainActor Equatable {
     }
 
     private var rowHelp: String {
+        if let runtimeConfigurationError { return runtimeConfigurationError }
         if let preferredPreloadSlot,
             selectedPreloadSlots.contains(preferredPreloadSlot)
         {
@@ -2469,22 +2496,15 @@ private struct ActiveDownloadBannerRow: View {
                         .font(.headline)
                         .lineLimit(1)
 
-                    Group {
-                        if isFinishing {
-                            Text("Finishing…")
-                                .bold()
-                        } else {
-                            HStack(spacing: 4) {
-                                Text(statusText)
-                                    .foregroundStyle(.secondary)
-                                Text("·")
-                                    .foregroundStyle(.secondary)
-                                    .accessibilityHidden(true)
-                                Text("\(percentage)%")
-                                    .bold()
-                                    .monospacedDigit()
-                            }
-                        }
+                    HStack(spacing: 4) {
+                        Text(statusText)
+                            .foregroundStyle(.secondary)
+                        Text("·")
+                            .foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
+                        Text("\(percentage)%")
+                            .bold()
+                            .monospacedDigit()
                     }
                     .font(.subheadline)
                 }
@@ -2518,33 +2538,21 @@ private struct ActiveDownloadBannerRow: View {
                 .controlSize(.large)
             }
 
-            Group {
-                if isFinishing {
-                    ProgressView()
-                        .accessibilityLabel("Finishing download")
-                        .accessibilityValue("Assembling downloaded model files")
-                } else {
-                    ProgressView(value: displayedProgress)
-                        .animation(
-                            reduceMotion ? nil : .linear(duration: 0.25),
-                            value: displayedProgress
-                        )
-                        .accessibilityLabel("Download progress")
-                        .accessibilityValue("\(percentage) percent")
-                }
-            }
-            .progressViewStyle(.linear)
-            .tint(download.state == .paused ? .secondary : .accentColor)
+            ProgressView(value: displayedProgress)
+                .animation(
+                    reduceMotion ? nil : .linear(duration: 0.25),
+                    value: displayedProgress
+                )
+                .accessibilityLabel("Download progress")
+                .accessibilityValue("\(percentage) percent")
+                .progressViewStyle(.linear)
+                .tint(download.state == .paused ? .secondary : .accentColor)
 
             HStack(spacing: 6) {
-                if isFinishing {
-                    Text("Assembling downloaded model files…")
-                } else {
-                    Text(byteProgress ?? "Calculating download size…")
-                        .monospacedDigit()
-                }
+                Text(byteProgress ?? "Calculating download size…")
+                    .monospacedDigit()
 
-                if !isFinishing, let speed {
+                if let speed {
                     Text("·")
                         .accessibilityHidden(true)
                     Text(speed)
@@ -2574,12 +2582,6 @@ private struct ActiveDownloadBannerRow: View {
         min(max(download.progress, 0), 0.99)
     }
 
-    private var isFinishing: Bool {
-        download.state == .downloading
-            && (download.phase == .finalizing
-                || ModelDownloadProgressPresentation.isFinishing(download.progress))
-    }
-
     private var pauseResumeTitle: String {
         download.state == .paused ? "Resume download" : "Pause download"
     }
@@ -2604,7 +2606,6 @@ private struct ActiveDownloadBannerRow: View {
         switch download.phase {
         case .preparing: return "Preparing"
         case .downloading: return "Downloading"
-        case .finalizing: return "Finishing"
         case .retrying: return "Retrying"
         }
     }
@@ -2803,12 +2804,35 @@ private struct HubModelRow: View, @MainActor Equatable {
                         .font(.caption.weight(.semibold))
                 }
             }
+        case let .insufficientSpace(required, available, reservedByOtherDownloads):
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Not enough disk space", systemImage: "externaldrive.badge.exclamationmark")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.orange)
+                Text(
+                    "Needs \(Self.bytes(required)) · \(Self.bytes(available)) available"
+                        + (reservedByOtherDownloads > 0
+                            ? " · \(Self.bytes(reservedByOtherDownloads)) held by downloads in progress"
+                            : "")
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+                Link(destination: URL(string: "x-apple.systempreferences:com.apple.settings.Storage")!) {
+                    Label("Open Storage Settings", systemImage: "arrow.up.right")
+                        .font(.caption.weight(.semibold))
+                }
+            }
         case .message:
             Label(error.localizedDescription, systemImage: "exclamationmark.triangle.fill")
                 .font(.caption)
                 .foregroundStyle(.orange)
                 .textSelection(.enabled)
         }
+    }
+
+    private static func bytes(_ count: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: count, countStyle: .file)
     }
 
     private var modelHubURL: URL {
@@ -3135,9 +3159,6 @@ struct ModelDownloadProgressControl: View {
         if isPaused {
             return "Download paused"
         }
-        if ModelDownloadProgressPresentation.isFinishing(progress) {
-            return "Finishing download"
-        }
         return "Downloading \(ModelDownloadProgressPresentation.activePercentage(progress)) percent"
     }
 }
@@ -3254,6 +3275,7 @@ private struct ModelsNotice: View {
     let message: String
     let systemImage: String
     let color: Color
+    var onRetry: (() -> Void)? = nil
     var onDismiss: (() -> Void)? = nil
 
     var body: some View {
@@ -3267,6 +3289,11 @@ private struct ModelsNotice: View {
                     .textSelection(.enabled)
             }
             Spacer()
+            if let onRetry {
+                Button("Retry", systemImage: "arrow.clockwise", action: onRetry)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
             if let onDismiss {
                 Button(action: onDismiss) {
                     Image(systemName: "xmark")
@@ -3419,6 +3446,8 @@ extension LocalModelCapability {
 extension LocalModelProvider {
     fileprivate var modelBadgeColor: Color {
         switch self {
+        case .recursiveSI:
+            .primary
         case .google:
             .primary
         case .openAI:
@@ -3476,6 +3505,8 @@ extension LocalModelProvider {
         case .stepFun:
             .primary
         case .internLM:
+            .primary
+        case .gradium:
             .primary
         }
     }

@@ -688,6 +688,7 @@ struct NativSettings: Codable, Equatable {
     /// Set once the Up-arrow recall has been used, which retires its hint.
     var hasUsedPromptRecall: Bool
     var chatFontScale: Double
+    var chatResponseTimeout: NativChatTimeout
     var sidebarPinnedCollapsed: Bool
     var sidebarProjectsCollapsed: Bool
     var sidebarSessionsCollapsed: Bool
@@ -743,11 +744,12 @@ struct NativSettings: Codable, Equatable {
         structuredOutputEnabled: Bool = false,
         structuredOutputName: String = "Response",
         structuredOutputSchema: String = Self.defaultStructuredOutputSchema,
-        prefixCachingEnabled: Bool = false,
+        prefixCachingEnabled: Bool = true,
         prefixCacheBlocks: Int = 2048,
         prefixCacheBlockSize: Int = 16,
         hasUsedPromptRecall: Bool = false,
         chatFontScale: Double = Self.defaultChatFontScale,
+        chatResponseTimeout: NativChatTimeout = .tenMinutes,
         sidebarPinnedCollapsed: Bool = false,
         sidebarProjectsCollapsed: Bool = false,
         sidebarSessionsCollapsed: Bool = false,
@@ -807,6 +809,7 @@ struct NativSettings: Codable, Equatable {
         self.prefixCacheBlockSize = prefixCacheBlockSize
         self.hasUsedPromptRecall = hasUsedPromptRecall
         self.chatFontScale = chatFontScale
+        self.chatResponseTimeout = chatResponseTimeout
         self.sidebarPinnedCollapsed = sidebarPinnedCollapsed
         self.sidebarProjectsCollapsed = sidebarProjectsCollapsed
         self.sidebarSessionsCollapsed = sidebarSessionsCollapsed
@@ -869,6 +872,7 @@ struct NativSettings: Codable, Equatable {
         case prefixCacheBlockSize
         case hasUsedPromptRecall
         case chatFontScale
+        case chatResponseTimeout
         case sidebarPinnedCollapsed
         case sidebarProjectsCollapsed
         case sidebarSessionsCollapsed
@@ -1026,6 +1030,8 @@ struct NativSettings: Codable, Equatable {
         chatFontScale =
             try container.decodeIfPresent(Double.self, forKey: .chatFontScale)
             ?? defaults.chatFontScale
+        chatResponseTimeout = (try container.decodeIfPresent(Int.self, forKey: .chatResponseTimeout))
+            .flatMap(NativChatTimeout.init(rawValue:)) ?? defaults.chatResponseTimeout
         sidebarPinnedCollapsed =
             try container.decodeIfPresent(Bool.self, forKey: .sidebarPinnedCollapsed)
             ?? defaults.sidebarPinnedCollapsed
@@ -1094,6 +1100,7 @@ struct NativSettings: Codable, Equatable {
         try container.encode(prefixCacheBlockSize, forKey: .prefixCacheBlockSize)
         try container.encode(hasUsedPromptRecall, forKey: .hasUsedPromptRecall)
         try container.encode(chatFontScale, forKey: .chatFontScale)
+        try container.encode(chatResponseTimeout, forKey: .chatResponseTimeout)
         try container.encode(sidebarPinnedCollapsed, forKey: .sidebarPinnedCollapsed)
         try container.encode(sidebarProjectsCollapsed, forKey: .sidebarProjectsCollapsed)
         try container.encode(sidebarSessionsCollapsed, forKey: .sidebarSessionsCollapsed)
@@ -1318,6 +1325,42 @@ struct NativSettings: Codable, Equatable {
         chatFontScale = steps[min(max(current + delta, 0), steps.count - 1)]
     }
 
+    mutating func resetModelConfiguration() {
+        let defaults = NativSettings()
+        maxTokens = defaults.maxTokens
+        maxKVSize = defaults.maxKVSize
+        compactionEnabled = defaults.compactionEnabled
+        compactionThresholdPercent = defaults.compactionThresholdPercent
+        systemPrompt = defaults.systemPrompt
+        temperature = defaults.temperature
+        topK = defaults.topK
+        topP = defaults.topP
+        minP = defaults.minP
+        repetitionPenaltyEnabled = defaults.repetitionPenaltyEnabled
+        repetitionPenalty = defaults.repetitionPenalty
+        kvQuantizationEnabled = defaults.kvQuantizationEnabled
+        kvBits = defaults.kvBits
+        kvGroupSize = defaults.kvGroupSize
+        quantizedKVStart = defaults.quantizedKVStart
+        turboQuantEnabled = defaults.turboQuantEnabled
+        thinkingEnabled = defaults.thinkingEnabled
+        thinkingBudgetEnabled = defaults.thinkingBudgetEnabled
+        thinkingBudget = defaults.thinkingBudget
+        thinkingStartToken = defaults.thinkingStartToken
+        thinkingEndToken = defaults.thinkingEndToken
+        speculativeDecodingEnabled = defaults.speculativeDecodingEnabled
+        draftModelID = defaults.draftModelID
+        draftKind = defaults.draftKind
+        draftBlockSize = defaults.draftBlockSize
+        structuredOutputEnabled = defaults.structuredOutputEnabled
+        structuredOutputName = defaults.structuredOutputName
+        structuredOutputSchema = defaults.structuredOutputSchema
+        prefixCachingEnabled = defaults.prefixCachingEnabled
+        prefixCacheBlocks = defaults.prefixCacheBlocks
+        prefixCacheBlockSize = defaults.prefixCacheBlockSize
+        if let languageModelID { rememberProfile(forModel: languageModelID) }
+    }
+
     mutating func resetChatFontScale() {
         chatFontScale = Self.defaultChatFontScale
     }
@@ -1368,23 +1411,27 @@ struct NativSettings: Codable, Equatable {
             && lhs.huggingFaceToken == rhs.huggingFaceToken
             && lhs.serverHost == rhs.serverHost
             && lhs.serverPort == rhs.serverPort
-            && lhs.maxTokens == rhs.maxTokens
-            && lhs.maxKVSize == rhs.maxKVSize
-            && lhs.kvQuantizationEnabled == rhs.kvQuantizationEnabled
-            && (!lhs.kvQuantizationEnabled
-                || (lhs.kvBits == rhs.kvBits
-                    && lhs.kvGroupSize == rhs.kvGroupSize
-                    && lhs.quantizedKVStart == rhs.quantizedKVStart
-                    && lhs.turboQuantEnabled == rhs.turboQuantEnabled))
-            && lhsSpeculativeDecodingActive == rhsSpeculativeDecodingActive
-            && (!lhsSpeculativeDecodingActive
-                || (lhs.draftModelID == rhs.draftModelID
-                    && lhs.draftKind == rhs.draftKind
-                    && lhs.draftBlockSize == rhs.draftBlockSize))
-            && lhs.prefixCachingEnabled == rhs.prefixCachingEnabled
-            && (!lhs.prefixCachingEnabled
-                || (lhs.prefixCacheBlocks == rhs.prefixCacheBlocks
-                    && lhs.prefixCacheBlockSize == rhs.prefixCacheBlockSize))
+            // The engine has no live setting for draft block size yet.
+            && (lhsSpeculativeDecodingActive ? lhs.draftBlockSize : 0)
+                == (rhsSpeculativeDecodingActive ? rhs.draftBlockSize : 0)
+    }
+
+    /// Settings accepted by the engine's management API. Explicit nulls clear
+    /// optional overrides; zero restores the model's full context window.
+    var runtimeSettings: [String: MLXJSONValue] {
+        let settings = normalized()
+        return [
+            "apc_enabled": .bool(settings.prefixCachingEnabled),
+            "apc_num_blocks": .number(Double(settings.prefixCacheBlocks)),
+            "apc_block_size": .number(Double(settings.prefixCacheBlockSize)),
+            "max_kv_size": .number(Double(settings.maxKVSize)),
+            "kv_bits": settings.kvQuantizationEnabled ? .number(settings.kvBits) : .null,
+            "kv_quant_scheme": .string(settings.kvQuantizationEnabled && settings.turboQuantEnabled ? "turboquant" : "uniform"),
+            "kv_group_size": settings.kvQuantizationEnabled ? .number(Double(settings.kvGroupSize)) : .null,
+            "quantized_kv_start": settings.kvQuantizationEnabled ? .number(Double(settings.quantizedKVStart)) : .null,
+            "draft_model": settings.speculativeDecodingActive ? .string(settings.draftModelID) : .null,
+            "draft_kind": settings.speculativeDecodingActive && settings.draftKind != "auto" ? .string(settings.draftKind) : .null,
+        ]
     }
 
     var serverBaseURL: URL {

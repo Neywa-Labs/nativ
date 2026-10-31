@@ -75,6 +75,13 @@ final class ChatWorkBrowserPool {
         let matches = browsers[sessionID]?.filter { $0.value.elementLabels[elementID] != nil } ?? [:]
         return matches.count == 1 ? matches.keys.first : nil
     }
+
+    func sourceLink(for elementID: String, sessionID: UUID) -> (id: UUID, url: String)? {
+        let matches = (browsers[sessionID] ?? [:]).compactMap { id, browser -> (UUID, String)? in
+            browser.sourceURL(for: elementID).map { (id, $0) }
+        }
+        return matches.count == 1 ? matches.first : nil
+    }
 }
 
 /// The pane and the agent use this exact WebKit instance, including its navigation state.
@@ -99,8 +106,29 @@ final class ChatWorkBrowser: NSObject, ObservableObject, WKNavigationDelegate, W
     private var previewGeneration = UUID()
     private var isStartingPreview = false
     private var pendingNavigation: WKNavigation?
+    private var navigationFailure: ChatWorkNavigationFailure?
+    private var httpStatus: Int?
     private var observations: [NSKeyValueObservation] = []
     fileprivate(set) var elementLabels: [String: String] = [:]
+    private var searchResultTitles: [String: String] = [:]
+    private var openedSearchTitles: [String] = []
+    private var searchLinks: [(id: String, url: String, title: String)] = []
+
+    func sourceURL(for elementID: String) -> String? {
+        searchLinks.first { $0.id == elementID }?.url
+    }
+
+    /// Search links are immutable navigation references, not live DOM controls.
+    /// Keep them across page visits so several results can be opened from one search.
+    func rememberSearchLinks(in snapshot: inout [String: Any]) {
+        let links = snapshot.removeValue(forKey: "source_links") as? [[String: String]] ?? []
+        for link in links {
+            guard let id = link["id"], let rawURL = link["url"], let title = link["title"],
+                  let url = try? ChatWorkState.webURL(rawURL), !searchLinks.contains(where: { $0.id == id }) else { continue }
+            searchLinks.append((id, url.absoluteString, title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()))
+        }
+        searchLinks = Array(searchLinks.suffix(128))
+    }
 
     init(profile: ChatWorkBrowserProfile = .shared) {
         self.profile = profile
@@ -156,6 +184,7 @@ final class ChatWorkBrowser: NSObject, ObservableObject, WKNavigationDelegate, W
             loadedContent = item.content
             modelURL = nil
             errorMessage = nil
+            navigationFailure = nil
             runtimeErrors = []
             elementLabels = [:]
             previewLoad?.cancel()
@@ -218,6 +247,7 @@ final class ChatWorkBrowser: NSObject, ObservableObject, WKNavigationDelegate, W
         annotator.cancel()
         loadedURL = url.absoluteString
         errorMessage = nil
+        navigationFailure = nil
         elementLabels = [:]
         pendingNavigation = webView.load(URLRequest(url: url, timeoutInterval: 30))
     }
@@ -258,23 +288,55 @@ final class ChatWorkBrowser: NSObject, ObservableObject, WKNavigationDelegate, W
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        if navigation === pendingNavigation { pendingNavigation = nil }
-        if (error as NSError).code != NSURLErrorCancelled { errorMessage = error.localizedDescription }
+        recordNavigationFailure(navigation, error: error)
+    }
+
+    private func recordNavigationFailure(_ navigation: WKNavigation?, error: Error) {
+        // A cancelled or superseded load must not poison the next page's result.
+        guard navigation === pendingNavigation else { return }
+        pendingNavigation = nil
+        let failure = error as NSError
+        if failure.domain != NSURLErrorDomain || failure.code != NSURLErrorCancelled {
+            let url = (failure.userInfo[NSURLErrorFailingURLErrorKey] as? URL)?.absoluteString
+                ?? failure.userInfo[NSURLErrorFailingURLStringErrorKey] as? String ?? loadedURL
+            navigationFailure = ChatWorkNavigationFailure(url: url, message: error.localizedDescription)
+            errorMessage = error.localizedDescription
+            elementLabels = [:]
+        }
         refreshNavigation()
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse) async -> WKNavigationResponsePolicy {
+        if navigationResponse.isForMainFrame {
+            httpStatus = (navigationResponse.response as? HTTPURLResponse)?.statusCode
+        }
+        // Authentication/challenge pages (401/403) may still need browser interaction.
+        if navigationResponse.isForMainFrame, let response = navigationResponse.response as? HTTPURLResponse,
+           response.statusCode == 404 || response.statusCode == 410 || response.statusCode >= 500 {
+            let message = "The website returned HTTP \(response.statusCode) (\(HTTPURLResponse.localizedString(forStatusCode: response.statusCode)))."
+            navigationFailure = ChatWorkNavigationFailure(url: response.url?.absoluteString,
+                                                          message: message, httpStatus: response.statusCode)
+            errorMessage = message
+            elementLabels = [:]
+        }
+        return .allow
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         annotator.cancel()
         pendingNavigation = navigation
+        httpStatus = nil
         runtimeErrors = []
         errorMessage = nil
+        navigationFailure = nil
         elementLabels = [:]
         refreshNavigation()
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        if navigation === pendingNavigation { pendingNavigation = nil }
-        errorMessage = nil
+        guard navigation === pendingNavigation else { return }
+        pendingNavigation = nil
+        if navigationFailure == nil { errorMessage = nil }
         refreshNavigation()
     }
 
@@ -283,9 +345,7 @@ final class ChatWorkBrowser: NSObject, ObservableObject, WKNavigationDelegate, W
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        if navigation === pendingNavigation { pendingNavigation = nil }
-        if (error as NSError).code != NSURLErrorCancelled { errorMessage = error.localizedDescription }
-        refreshNavigation()
+        recordNavigationFailure(navigation, error: error)
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -295,10 +355,10 @@ final class ChatWorkBrowser: NSObject, ObservableObject, WKNavigationDelegate, W
     }
 
     private func refreshNavigation() {
-        address = webView.url?.absoluteString ?? loadedURL ?? ""
+        address = navigationFailure?.url ?? webView.url?.absoluteString ?? loadedURL ?? ""
         // isLoading changes before WebKit replaces its old URL. Publishing that old URL
         // would save it back to the item and make SwiftUI load the previous page again.
-        if pendingNavigation == nil && !webView.isLoading { publishCommittedAddress() }
+        if pendingNavigation == nil && !webView.isLoading && navigationFailure == nil { publishCommittedAddress() }
         isLoading = isStartingPreview || webView.isLoading
         canGoBack = webView.canGoBack
         canGoForward = webView.canGoForward
@@ -314,15 +374,19 @@ final class ChatWorkBrowser: NSObject, ObservableObject, WKNavigationDelegate, W
         onNavigate?(url)
     }
 
-    func execute(_ request: ChatWorkRequest) async throws -> [String: Any] {
+    func execute(_ request: ChatWorkRequest, attachments: [ChatImageAttachment] = []) async throws -> [String: Any] {
         try Task.checkCancellation()
         guard !profile.isClearingWebsiteData else {
             throw ChatWorkError.invalid("Website data is being cleared. Try again in a moment.")
         }
         switch request.action {
-        case .navigate:
-            guard let url = request.url else { throw ChatWorkError.invalid("navigate requires url.") }
-            try navigate(url)
+        case .navigate, .search:
+            guard let url = try request.navigationURL else { throw ChatWorkError.invalid("navigate requires url.") }
+            if let reference = searchLinks.first(where: { $0.id == request.elementID && $0.url == url.absoluteString }),
+               !openedSearchTitles.contains(reference.title) {
+                openedSearchTitles = Array((openedSearchTitles + [reference.title]).suffix(64))
+            }
+            try navigate(url.absoluteString)
         case .back:
             guard webView.canGoBack else { throw ChatWorkError.invalid("This tab has no previous page.") }
             pendingNavigation = webView.goBack()
@@ -334,33 +398,79 @@ final class ChatWorkBrowser: NSObject, ObservableObject, WKNavigationDelegate, W
         default: break
         }
         try await waitForPage()
-        if request.action == .click || request.action == .type {
+        var selectedFiles: [[String: Any]]?
+        if request.action == .click || request.action == .type || request.action == .upload {
             guard let elementID = request.elementID else {
                 throw ChatWorkError.invalid("Inspect the page, then supply an element_id.")
             }
+            let searchTitle = searchResultTitles[elementID]
             if request.action == .type && request.text == nil {
                 throw ChatWorkError.invalid("type requires text.")
             }
+            var files: [ChatWorkAttachments.File] = []
+            if request.action == .upload {
+                guard !attachments.isEmpty, attachments.count <= ChatWorkAttachments.maximumFiles,
+                      request.attachmentIDs == attachments.map(\.id),
+                      Set(attachments.map(\.id)).count == attachments.count else {
+                    throw ChatWorkError.invalid("upload requires original attachments resolved from this chat.")
+                }
+                files = try await ChatWorkAttachments.load(attachments)
+            }
+            try Task.checkCancellation()
             let result = try await webView.callAsyncJavaScript(Self.actionScript, arguments: [
-                "elementID": elementID, "action": request.action.rawValue, "text": request.text ?? ""
+                "elementID": elementID, "action": request.action.rawValue, "text": request.text ?? "",
+                "files": files.map { ["name": $0.filename, "type": $0.mimeType, "base64": $0.data.base64EncodedString()] }
             ], in: nil, contentWorld: .defaultClient)
             if let error = result as? String, !error.isEmpty { throw ChatWorkError.invalid(error) }
+            if request.action == .click, let title = searchTitle, !openedSearchTitles.contains(title) {
+                openedSearchTitles.append(title)
+                openedSearchTitles = Array(openedSearchTitles.suffix(64))
+            }
+            if request.action == .upload {
+                selectedFiles = files.map {
+                    ["attachment_id": $0.id.uuidString, "filename": $0.filename,
+                     "mime_type": $0.mimeType, "size": $0.data.count]
+                }
+            }
             // Let click/input event handlers and resulting navigations begin before observing again.
             try await Task.sleep(for: .milliseconds(150))
             try await waitForPage()
         }
         try Task.checkCancellation()
+        // Search navigation can finish before Google inserts its result links.
+        let searchPage = webView.url?.host?.range(of: #"(^|\.)google\.[a-z.]+$"#, options: .regularExpression) != nil
+            && webView.url?.path == "/search"
+        if searchPage {
+            for _ in 0..<32 {
+                let ready = try await webView.callAsyncJavaScript(
+                    "return [...document.querySelectorAll('a h3')].some(h => h.innerText.trim()) || !!document.querySelector('[role=dialog]');",
+                    arguments: [:], in: nil, contentWorld: .defaultClient) as? Bool ?? false
+                if ready { break }
+                try await Task.sleep(for: .milliseconds(250))
+            }
+        }
         guard var object = try await webView.callAsyncJavaScript(
             Self.inspectScript, arguments: ["snapshotID": UUID().uuidString,
+                                           "isSearchPage": searchPage,
+                                           "openedTitles": openedSearchTitles,
                                            "tabID": request.id?.uuidString ?? "",
                                            "canGoBack": webView.canGoBack,
                                            "canGoForward": webView.canGoForward], in: nil, contentWorld: .defaultClient
         ) as? [String: Any] else { throw ChatWorkError.invalid("The page could not be inspected.") }
+        rememberSearchLinks(in: &object)
+        object["http_status"] = httpStatus
+        if let status = httpStatus, status >= 400 { object["page_status"] = "blocked" }
         object["runtime_errors"] = runtimeErrors
         object["local_page_url"] = localPageURL?.absoluteString
-        if let elements = object["elements"] as? [[String: Any]] {
-            elementLabels = Dictionary(elements.compactMap { element in
-                guard let id = element["id"] as? String, let label = element["label"] as? String else { return nil }
+        object["selected_files"] = selectedFiles
+        searchResultTitles = Dictionary((object["results"] as? [[String: Any]] ?? []).compactMap { result in
+            guard let id = result["id"] as? String, let title = result["title"] as? String else { return nil }
+            return (id, title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+        }, uniquingKeysWith: { first, _ in first })
+        let controls = (object["elements"] as? [[String: Any]] ?? []) + (object["results"] as? [[String: Any]] ?? [])
+        do {
+            elementLabels = Dictionary(controls.compactMap { element in
+                guard let id = element["id"] as? String, let label = (element["label"] ?? element["title"]) as? String else { return nil }
                 return (id, label.isEmpty ? (element["tag"] as? String ?? "control") : label)
             }, uniquingKeysWith: { first, _ in first })
         }
@@ -376,6 +486,7 @@ final class ChatWorkBrowser: NSObject, ObservableObject, WKNavigationDelegate, W
             }
             try await Task.sleep(for: .milliseconds(100))
         }
+        if let navigationFailure { throw navigationFailure }
         if let errorMessage { throw ChatWorkError.invalid(errorMessage) }
     }
 
@@ -394,28 +505,68 @@ final class ChatWorkBrowser: NSObject, ObservableObject, WKNavigationDelegate, W
         })();
         """
 
-    private static let inspectScript = """
+    static let inspectScript = """
         const visible = el => {
             const r = el.getBoundingClientRect(), s = getComputedStyle(el);
             return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
         };
         const token = snapshotID;
         const refs = new Map();
-        const elements = [...document.querySelectorAll('a[href],button,input,textarea,select,[role="button"],[contenteditable="true"]')]
-            .filter(visible).slice(0, 150).map((el, i) => {
+        const search = isSearchPage;
+        const opened = new Set(typeof openedTitles === 'undefined' ? [] : openedTitles);
+        const resultTitle = el => el.querySelector('h3')?.innerText.slice(0, 180) || '';
+        const wasOpened = el => opened.has(resultTitle(el).trim().toLowerCase());
+        const resultLinks = search ? [...document.querySelectorAll('a h3')].map(h => h.closest('a'))
+            .sort((a, b) => Number(wasOpened(a)) - Number(wasOpened(b))) : [];
+        const dialogs = [...document.querySelectorAll('[role="dialog"]')].filter(visible);
+        const dialogControls = dialogs.flatMap(d => [...d.querySelectorAll('a[href],button,input,[role="button"]')]);
+        const contentControls = search ? [] : [...document.querySelectorAll('article a[href],main a[href],[role="main"] a[href]')];
+        const fileInputs = [...document.querySelectorAll('input[type="file"]')].slice(0, 20);
+        const controls = [...new Set([...dialogControls, ...resultLinks, ...contentControls, ...document.querySelectorAll('a[href],button,input,textarea,select,[role="button"],[contenteditable="true"]')])]
+            .filter(el => el.type !== 'file' && visible(el)).slice(0, 40);
+        const elements = [...controls, ...fileInputs].map((el, i) => {
                 const id = token + ':' + i;
                 const label = (el.getAttribute('aria-label') || el.labels?.[0]?.innerText || el.innerText
-                    || el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('name') || '').slice(0, 180);
-                refs.set(id, {el, label, value: el.value, type: el.getAttribute('type'), href: el.getAttribute('href')});
-                const value = ['password','file','hidden'].includes(el.type) ? undefined : el.value;
+                    || el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('name')
+                    || (el.type === 'file' ? el.id || 'File upload' : '')).slice(0, 180);
+                refs.set(id, {el, label, value: el.value, type: el.getAttribute('type'), href: el.getAttribute('href'),
+                    url: location.href, accept: el.accept, multiple: el.multiple, directory: el.webkitdirectory,
+                    formAction: el.form?.action, files: el.files ? [...el.files] : []});
+                const value = ['password','file','hidden'].includes(el.type) ? undefined : el.value?.slice(0, 500);
                 return {id, tag: el.tagName.toLowerCase(), type: el.getAttribute('type'), label,
                     ...(value === undefined ? {} : {value}),
-                    href: el.getAttribute('href'), disabled: !!el.disabled};
+                    ...(el.type === 'file' ? {accept: el.accept, multiple: el.multiple, hidden: !visible(el),
+                        files: [...el.files].map(file => ({name: file.name, type: file.type, size: file.size}))} : {}),
+                    href: el.href?.slice(0, 2048), disabled: !!el.disabled};
             });
         globalThis.__nativWorkRefs = refs;
-        return {id: tabID, kind: 'website', url: location.href, title: document.title,
+        const transcript = [...document.querySelectorAll('ytd-transcript-segment-renderer,[data-transcript-segment]')]
+            .filter(visible).map(el => el.innerText).join('\\n');
+        const body = transcript || (document.querySelector('article,main,[role="main"]') || document.body)?.innerText || '';
+        const dialog = dialogs[0];
+        const article = document.querySelector('article')?.innerText || '';
+        const login = [...document.querySelectorAll('input[type="password"]')].some(visible) && article.length < 300;
+        const consentPage = /^consent\\.(?:youtube\\.com|google\\.[a-z.]+)$/i.test(location.hostname);
+        const blocked = consentPage || login || /^(?:\\s*(?:404|page not found|access denied|just a moment|verify you are human)\\b)/i.test(body)
+            || (!!dialog && /cookie|consent|sign in|log in|verify/i.test(dialog.innerText));
+        const preview = /member.only story/i.test(body) && article.trim().length < 1500;
+        const insufficient = body.trim().length < 80 && !!document.querySelector('video,audio');
+        const mediaMetadata = !!document.querySelector('video,audio') && article.trim().length < 300 && transcript.trim().length < 80;
+        const results = search ? elements.filter(e => resultLinks.includes(refs.get(e.id).el)).slice(0, 10).map(e => ({
+            id: e.id, title: resultTitle(refs.get(e.id).el), title_previously_opened: wasOpened(refs.get(e.id).el),
+            open: {action: 'open', element_id: e.id}
+        })) : [];
+        return {id: tabID, kind: 'website', source_kind: search ? 'search' : 'page', url: location.href, title: document.title,
+            page_status: blocked ? 'blocked' : search ? 'search' : preview ? 'preview' : insufficient ? 'insufficient_text' : mediaMetadata ? 'media_metadata' : 'readable',
             can_go_back: canGoBack, can_go_forward: canGoForward, untrusted_page_content: true,
-            text: (document.body?.innerText || '').slice(0, 18000), elements};
+            text_truncated: !search && body.length > 6000,
+            text: search ? (dialog ? dialog.innerText.slice(0, 2000) : 'Use chat_work with a result’s open action to read it. Search results do not count as source-page reads.') : body.slice(0, 6000),
+            ...(search ? {results} : {}),
+            source_links: results.map(r => ({id: r.id, title: r.title, url: refs.get(r.id).el.href})),
+            elements: search ? elements.filter(e => {
+                const el = refs.get(e.id).el;
+                return !resultLinks.includes(el) && (e.tag !== 'a' || dialogControls.includes(el));
+            }).slice(0, 8) : elements};
         """
 
     private static let actionScript = """
@@ -423,15 +574,45 @@ final class ChatWorkBrowser: NSObject, ObservableObject, WKNavigationDelegate, W
         if (!ref || !ref.el.isConnected) return 'The element is stale. Inspect the page again.';
         const el = ref.el;
         const label = (el.getAttribute('aria-label') || el.labels?.[0]?.innerText || el.innerText
-            || el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('name') || '').slice(0, 180);
+            || el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('name')
+            || (el.type === 'file' ? el.id || 'File upload' : '')).slice(0, 180);
         const r = el.getBoundingClientRect(), s = getComputedStyle(el);
-        if (el.disabled || !r.width || !r.height || s.visibility === 'hidden' || s.display === 'none'
+        const upload = action === 'upload';
+        if (el.matches(':disabled') || location.href !== ref.url
+            || (!upload && (!r.width || !r.height || s.visibility === 'hidden' || s.display === 'none'))
             || label !== ref.label || el.value !== ref.value || el.getAttribute('type') !== ref.type || el.getAttribute('href') !== ref.href)
             return 'The element changed. Inspect the page again.';
+        if (upload) {
+            if (!(el instanceof HTMLInputElement) || el.type !== 'file') return 'upload requires a file input from inspect.';
+            if (el.accept !== ref.accept || el.multiple !== ref.multiple || el.webkitdirectory !== ref.directory
+                || el.form?.action !== ref.formAction || el.files.length !== ref.files.length
+                || [...el.files].some((file, i) => file !== ref.files[i]))
+                return 'The file input changed. Inspect the page again.';
+            if (el.webkitdirectory) return 'Folder uploads are not supported. Choose a file input.';
+            if (!files.length || (!el.multiple && files.length > 1)) return 'This file input accepts one file. Upload one attachment.';
+            const accepted = el.accept.toLowerCase().split(',').map(value => value.trim()).filter(Boolean);
+            const accepts = file => !accepted.length || accepted.some(type => type === '*/*'
+                || (type.startsWith('.') ? file.name.toLowerCase().endsWith(type)
+                    : type.endsWith('/*') ? file.type.toLowerCase().startsWith(type.slice(0, -1))
+                    : file.type.toLowerCase() === type));
+            if (!files.every(accepts)) return 'A file does not match this input’s accept types. Inspect the page and choose a compatible input.';
+            const transfer = new DataTransfer();
+            for (const file of files) {
+                const bytes = Uint8Array.from(atob(file.base64), character => character.charCodeAt(0));
+                transfer.items.add(new File([bytes], file.name, {type: file.type}));
+            }
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files').set.call(el, transfer.files);
+            globalThis.__nativWorkRefs = null;
+            el.dispatchEvent(new Event('input', {bubbles:true}));
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+            return '';
+        }
         globalThis.__nativWorkRefs = null;
         el.scrollIntoView({block:'center'});
         if (action === 'click') { el.click(); return ''; }
-        if (el instanceof HTMLInputElement && ['password','file','hidden'].includes(el.type))
+        if (el instanceof HTMLInputElement && el.type === 'file')
+            return 'Use upload with attachment_ids from this chat’s attachments list.';
+        if (el instanceof HTMLInputElement && ['password','hidden'].includes(el.type))
             return 'This input must be filled by the user.';
         if (el.readOnly) return 'This input is read-only.';
         el.focus();

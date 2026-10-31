@@ -140,6 +140,65 @@ private enum ChatTranscriptLayout {
     static let scrollIndicatorClearance: CGFloat = 17
 }
 
+private struct ChatResponseSpeechContext {
+    let speech: ChatResponseSpeech
+    let settings: NativSettings
+    let preparation: ChatSpeechPreparation
+}
+
+private struct ChatResponseSpeechContextKey: EnvironmentKey {
+    static let defaultValue: ChatResponseSpeechContext? = nil
+}
+
+private extension EnvironmentValues {
+    var chatResponseSpeech: ChatResponseSpeechContext? {
+        get { self[ChatResponseSpeechContextKey.self] }
+        set { self[ChatResponseSpeechContextKey.self] = newValue }
+    }
+}
+
+private struct ChatResponseSpeechModifier: ViewModifier {
+    var model: NativModel
+    @ObservedObject var chat: ChatViewModel
+    let speech: ChatResponseSpeech
+
+    func body(content: Content) -> some View {
+        content
+            .environment(\.chatResponseSpeech, ChatResponseSpeechContext(
+                speech: speech, settings: model.settings, preparation: .automatic(using: model)
+            ))
+            .onChange(of: chat.currentSessionID, initial: true) { _, _ in
+                speech.stop()
+                speech.errorMessage = nil
+            }
+            .onChange(of: model.isRunning) { _, isRunning in
+                if !isRunning && speech.phase != .playing { speech.stop() }
+            }
+            .onReceive(HuggingFaceDownloadManager.shared.rowUpdates) { modelID in
+                guard let preparingModelID = speech.preparingModelID,
+                      modelID == nil || modelID == preparingModelID else { return }
+                speech.updateDownloadProgress(HuggingFaceDownloadManager.shared.progress(for: preparingModelID))
+            }
+            .onChange(of: model.settings.serverBaseURL) { _, _ in speech.stop() }
+            .onChange(of: model.settings.textToSpeechModelID) { _, _ in speech.stop() }
+            .onChange(of: chat.transcriptRevision.value) { _, _ in
+                if let messageID = speech.messageID,
+                   !chat.messages.contains(where: { $0.id == messageID }) {
+                    speech.stop()
+                }
+            }
+            .onDisappear { speech.stop() }
+            .alert("Unable to read aloud", isPresented: Binding(
+                get: { speech.errorMessage != nil },
+                set: { if !$0 { speech.errorMessage = nil } }
+            )) {
+                Button("OK", role: .cancel) { speech.errorMessage = nil }
+            } message: {
+                Text(speech.errorMessage ?? "")
+            }
+    }
+}
+
 private struct ChatWorktreeSetupView: View {
     let progress: ChatWorktreeSetupProgress
     let dismiss: () -> Void
@@ -728,6 +787,7 @@ private struct ChatTranscriptView: View {
     @State private var composerHeight: CGFloat = 0
     @State private var composerBackdropHeight: CGFloat = 0
     @State private var search: ChatSearchState
+    @State private var responseSpeech = ChatResponseSpeech()
     @Environment(\.chatLibrarySearch) private var librarySearch
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -776,6 +836,7 @@ private struct ChatTranscriptView: View {
         .environment(\.chatAnnotationActions, chat.annotationActions)
         .environment(\.canAddChatAnnotation, chat.pendingAnnotations.count < ChatAnnotation.maximumCount)
         .environment(\.chatSearchState, search)
+        .modifier(ChatResponseSpeechModifier(model: model, chat: chat, speech: responseSpeech))
         .focusedSceneValue(\.chatSearch, search)
         .onChange(of: chat.currentSessionID, initial: true) { _, id in
             search.reset(sessionID: id)
@@ -1109,6 +1170,7 @@ private struct ChatMessageRow: View, @MainActor Equatable {
     var prefillProgress = NativPrefillProgressState()
     @State private var didCopyMessage = false
     @State private var isHoveringMessage = false
+    @Environment(\.chatResponseSpeech) private var responseSpeech
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.message == rhs.message
@@ -1163,10 +1225,16 @@ private struct ChatMessageRow: View, @MainActor Equatable {
                 if displaysThinkingBubble {
                     ChatThinkingBubble(
                         content: message.reasoningContent,
-                        isThinking: message.isStreaming && message.content.isEmpty,
+                        isThinking: message.isStreaming && message.content.isEmpty && message.streamingToolCalls.isEmpty,
                         isStreaming: message.isStreaming,
                         thinkingDuration: message.thinkingDuration
                     )
+                }
+
+                if message.role == .assistant, message.isStreaming {
+                    ForEach(Array(message.streamingToolCalls.enumerated()), id: \.offset) { _, call in
+                        ChatAgentStepCell(streamingCall: call)
+                    }
                 }
 
                 if !message.annotationPresentation.annotations.isEmpty {
@@ -1181,6 +1249,16 @@ private struct ChatMessageRow: View, @MainActor Equatable {
                 }
             }
 
+            if message.role == .assistant, !message.isStreaming, let files = message.savedWorkFiles {
+                Label(
+                    files.isEmpty ? "No work-pane save confirmed" : "Saved in work pane: \(files.joined(separator: ", "))",
+                    systemImage: files.isEmpty ? "info.circle" : "checkmark.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help("Shows completed document saves through the work pane during this response. Reply text alone does not save a file. Changes made through other tools are not included.")
+            }
+
             if let responseMetrics {
                 ChatResponseMetricsRow(metrics: responseMetrics)
             }
@@ -1193,6 +1271,16 @@ private struct ChatMessageRow: View, @MainActor Equatable {
                                 didCopy: didCopyMessage,
                                 messageKind: message.role == .user ? "prompt" : "response",
                                 onCopy: copyMessage
+                            )
+                        }
+
+                        if message.role == .assistant, canCopyMessage,
+                           !displayContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                           let responseSpeech {
+                            ChatSpeakResponseButton(
+                                messageID: message.id,
+                                text: displayContent,
+                                context: responseSpeech
                             )
                         }
 
@@ -1226,8 +1314,8 @@ private struct ChatMessageRow: View, @MainActor Equatable {
                 }
                 // Align the visible icons with the response text, keeping their full hit areas.
                 .padding(.leading, message.role == .assistant ? -10 : 0)
-                .opacity(isHoveringMessage || didCopyMessage || isEditingUserMessage ? 1 : 0)
-                .accessibilityHidden(!isHoveringMessage && !didCopyMessage && !isEditingUserMessage)
+                .opacity(showsActiveMessageActions ? 1 : 0)
+                .accessibilityHidden(!showsActiveMessageActions)
             }
         }
         .frame(maxWidth: .infinity, alignment: rowAlignment)
@@ -1269,7 +1357,6 @@ private struct ChatMessageRow: View, @MainActor Equatable {
                     isUserPrompt: message.role == .user
                 )
                 .lineSpacing(2)
-                .fixedSize(horizontal: true, vertical: false)
             } else {
                 ChatMessageText(
                     messageID: message.id,
@@ -1354,7 +1441,7 @@ private struct ChatMessageRow: View, @MainActor Equatable {
             return false
         }
         return !message.reasoningContent.isEmpty
-            || (message.isThinkingEnabled && message.isStreaming && message.content.isEmpty)
+            || (message.isThinkingEnabled && message.isStreaming && message.content.isEmpty && message.streamingToolCalls.isEmpty)
     }
 
     private var rendersMarkdown: Bool {
@@ -1411,6 +1498,11 @@ private struct ChatMessageRow: View, @MainActor Equatable {
 
     private var showsMessageActions: Bool {
         message.role == .user || canCopyMessage || canForkAssistantResponse
+    }
+
+    private var showsActiveMessageActions: Bool {
+        isHoveringMessage || didCopyMessage || isEditingUserMessage
+            || responseSpeech?.speech.messageID == message.id
     }
 
     private var editActionTitle: String {
@@ -1620,9 +1712,11 @@ private struct ChatAgentTurnRow: View {
 
     private func shouldRender(_ message: ChatTranscriptMessage) -> Bool {
         message.isCompacting || message.compactionMetrics != nil
+            || !message.streamingToolCalls.isEmpty
             || !message.content.isEmpty
             || !message.imageAttachments.isEmpty
             || message.responseMetrics != nil
+            || message.savedWorkFiles != nil
             || canForkAssistantResponse
     }
 }
@@ -1785,7 +1879,12 @@ private struct ChatAgentStepCell: View {
     let onSelectImageModel: (UUID, String) -> Void
     let onCancelImageModelSelection: (UUID) -> Void
     let onExploreImageModels: (ChatImageOperation) -> Void
-    @State private var isExpanded = false
+    var isReceivingArguments = false
+    @State private var isExpanded: Bool?
+
+    private var showsDetails: Bool {
+        isExpanded ?? isReceivingArguments
+    }
 
     private var isAwaitingConsent: Bool {
         message.toolStatus == .awaitingConsent
@@ -1800,13 +1899,13 @@ private struct ChatAgentStepCell: View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
                 withAnimation(.snappy(duration: 0.2)) {
-                    isExpanded.toggle()
+                    isExpanded = !showsDetails
                 }
             } label: {
                 header
             }
             .buttonStyle(.plain)
-            .help(isExpanded ? "Hide call details" : "Show call details")
+            .help(showsDetails ? "Hide call details" : "Show call details")
             .disabled(isAwaitingConsent || isAwaitingImageModelSelection)
 
             if isAwaitingImageModelSelection {
@@ -1817,7 +1916,7 @@ private struct ChatAgentStepCell: View {
                 Divider()
                     .padding(.top, 7)
                 consentPrompt
-            } else if isExpanded {
+            } else if showsDetails {
                 Divider()
                     .padding(.top, 7)
                 details
@@ -1859,7 +1958,7 @@ private struct ChatAgentStepCell: View {
                     Image(systemName: "chevron.right")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .rotationEffect(.degrees(showsDetails ? 90 : 0))
                 }
             }
             if message.toolStatus == .failed, let toolErrorMessage {
@@ -1874,18 +1973,22 @@ private struct ChatAgentStepCell: View {
 
     @ViewBuilder
     private var statusBadge: some View {
-        switch message.toolStatus {
-        case .succeeded:
-            NativStatusBadge(text: "Done", tone: .success)
-        case .failed:
-            NativStatusBadge(text: "Failed", tone: .danger)
-        case .cancelled:
-            NativStatusBadge(text: "Canceled", tone: .neutral)
-        case .declined:
-            NativStatusBadge(text: "Declined", tone: .neutral)
-        case .preparing, .running, .awaitingConsent,
-            .awaitingImageModelSelection, nil:
-            EmptyView()
+        if isReceivingArguments {
+            NativStatusBadge(text: "In progress", tone: .active)
+        } else {
+            switch message.toolStatus {
+            case .succeeded:
+                NativStatusBadge(text: "Done", tone: .success)
+            case .failed:
+                NativStatusBadge(text: "Failed", tone: .danger)
+            case .cancelled:
+                NativStatusBadge(text: "Canceled", tone: .neutral)
+            case .declined:
+                NativStatusBadge(text: "Declined", tone: .neutral)
+            case .preparing, .running, .awaitingConsent,
+                .awaitingImageModelSelection, nil:
+                EmptyView()
+            }
         }
     }
 
@@ -2073,7 +2176,15 @@ private struct ChatAgentStepCell: View {
                 Text("Arguments")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
-                NativCodeBlock(raw: formattedArguments)
+                if isReceivingArguments {
+                    ScrollView {
+                        NativCodeBlock(raw: formattedArguments)
+                    }
+                    .defaultScrollAnchor(.bottom)
+                    .frame(maxHeight: 240)
+                } else {
+                    NativCodeBlock(raw: formattedArguments)
+                }
             }
             if !message.content.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
@@ -2098,11 +2209,13 @@ private struct ChatAgentStepCell: View {
     private var title: String {
         // For MCP tools show the bare tool name, not the mcp__slug__ prefix.
         let name = mcpToolParts?.tool ?? message.toolName
-        return ChatToolPresentation.title(toolName: name, status: message.toolStatus)
+        return ChatToolPresentation.title(
+            toolName: name, status: isReceivingArguments ? nil : message.toolStatus)
     }
 
     private var symbolName: String {
-        ChatToolPresentation.symbolName(toolName: message.toolName, status: message.toolStatus)
+        ChatToolPresentation.symbolName(
+            toolName: message.toolName, status: isReceivingArguments ? nil : message.toolStatus)
     }
 
     private var statusTone: NativStatusTone {
@@ -2134,7 +2247,8 @@ private struct ChatAgentStepCell: View {
     private var mcpServerSlug: String? { mcpToolParts?.slug }
 
     private var accessibilityStatus: String {
-        switch message.toolStatus {
+        if isReceivingArguments { return "in progress" }
+        return switch message.toolStatus {
         case .preparing:
             "preparing"
         case .running:
@@ -2163,6 +2277,28 @@ private struct ChatAgentStepCell: View {
             return nil
         }
         return object["error"] as? String
+    }
+}
+
+private extension ChatAgentStepCell {
+    init(streamingCall: MLXChatToolCall) {
+        self.init(
+            message: ChatTranscriptMessage(
+                role: .tool,
+                content: "",
+                toolCallID: streamingCall.id,
+                toolName: streamingCall.function?.name,
+                toolStatus: .preparing,
+                toolArguments: streamingCall.function?.arguments
+            ),
+            imageModelSelectionRequest: nil,
+            onConfirm: { _ in },
+            onDeny: { _ in },
+            onSelectImageModel: { _, _ in },
+            onCancelImageModelSelection: { _ in },
+            onExploreImageModels: { _ in },
+            isReceivingArguments: true
+        )
     }
 }
 
@@ -2306,6 +2442,56 @@ private struct ChatCopyMessageButton: View {
         .onHover { isHovering = $0 }
         .animation(.easeInOut(duration: 0.12), value: isHovering)
         .animation(.easeInOut(duration: 0.15), value: didCopy)
+    }
+}
+
+private struct ChatSpeakResponseButton: View {
+    let messageID: UUID
+    let text: String
+    let context: ChatResponseSpeechContext
+    @State private var isHovering = false
+
+    private var isActive: Bool { context.speech.messageID == messageID }
+    private var isPreparing: Bool { isActive && context.speech.phase != .playing }
+
+    private var title: String {
+        if isPreparing { return "Cancel reading aloud" }
+        if isActive { return "Stop reading aloud" }
+        return "Read aloud"
+    }
+
+    var body: some View {
+        Button {
+            context.speech.toggle(
+                messageID: messageID, text: text, settings: context.settings,
+                preparation: context.preparation
+            )
+        } label: {
+            HStack(spacing: 6) {
+                if isPreparing {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .overlay {
+                            Image(systemName: "stop.fill").font(.system(size: 5))
+                        }
+                    if let status = context.speech.statusText {
+                        Text(status).font(.caption).lineLimit(1)
+                    }
+                } else {
+                    Image(systemName: isActive ? "stop.fill" : "speaker.wave.2")
+                        .font(.system(size: 13, weight: .medium))
+                }
+            }
+            .foregroundStyle(isActive ? Color.accentColor : (isHovering ? Color.primary : Color.secondary))
+            .frame(minWidth: 30, minHeight: 28)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .help(title)
+        .accessibilityLabel(title)
+        .accessibilityValue(isPreparing ? context.speech.statusText ?? "Preparing to read aloud" : isActive ? "Reading aloud" : "")
+        .onHover { isHovering = $0 }
+        .animation(.easeInOut(duration: 0.12), value: isHovering)
     }
 }
 
@@ -2538,7 +2724,11 @@ private struct ChatResponseMetricsRow: View {
             value: NativFormatting.integer(metrics.totalTokens)
         )
         ChatResponseMetricPill(
-            label: "Decode tok/s",
+            label: "Prefill",
+            value: NativFormatting.rate(metrics.prefillTokensPerSecond)
+        )
+        ChatResponseMetricPill(
+            label: "Decode",
             value: NativFormatting.rate(metrics.decodeTokensPerSecond)
         )
         if let acceptanceRate = metrics.specAcceptanceRate {

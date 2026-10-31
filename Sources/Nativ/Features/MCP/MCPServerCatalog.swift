@@ -33,12 +33,15 @@ struct MCPCatalogEntry: Decodable, Equatable, Identifiable, Sendable {
     let requiredEnvironment: [String]
     let excludedEnvironment: [String]
     let legacyLaunchConfigurations: [LegacyLaunchConfiguration]
+    /// The server takes its allowed root folder as a trailing argument that Nativ
+    /// supplies per call, so the root is never stored in `arguments`.
+    let requiresFolder: Bool
     let sourceURL: String?
 
     var logoAssetName: String { "MCPLogo-\(name)" }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, summary, command, symbol, sourceURL
+        case id, name, summary, command, symbol, sourceURL, requiresFolder
         case arguments = "args"
         case tintName = "tint"
         case requiredEnvironment = "requiredEnv"
@@ -57,6 +60,7 @@ struct MCPCatalogEntry: Decodable, Equatable, Identifiable, Sendable {
         requiredEnvironment: [String] = [],
         excludedEnvironment: [String] = [],
         legacyLaunchConfigurations: [LegacyLaunchConfiguration] = [],
+        requiresFolder: Bool = false,
         sourceURL: String? = nil
     ) {
         self.id = id
@@ -69,6 +73,7 @@ struct MCPCatalogEntry: Decodable, Equatable, Identifiable, Sendable {
         self.requiredEnvironment = requiredEnvironment
         self.excludedEnvironment = excludedEnvironment
         self.legacyLaunchConfigurations = legacyLaunchConfigurations
+        self.requiresFolder = requiresFolder
         self.sourceURL = sourceURL
     }
 
@@ -93,6 +98,7 @@ struct MCPCatalogEntry: Decodable, Equatable, Identifiable, Sendable {
             [LegacyLaunchConfiguration].self,
             forKey: .legacyLaunchConfigurations
         ) ?? []
+        requiresFolder = try container.decodeIfPresent(Bool.self, forKey: .requiresFolder) ?? false
         sourceURL = try container.decodeIfPresent(String.self, forKey: .sourceURL)
     }
 
@@ -223,9 +229,6 @@ struct MCPServerCatalog: Sendable {
         }
     }
 
-    /// Refreshes built-in settings to their current catalog launch configuration.
-    /// This lets catalog entries move to a new server without changing their
-    /// durable identity or the user's enabled state.
     @discardableResult
     func migrateConfigurations(in servers: inout [MCPServerConfig]) -> Bool {
         var changed = false
@@ -277,7 +280,10 @@ struct MCPServerCatalog: Sendable {
         in servers: inout [MCPServerConfig]
     ) {
         servers[index].catalogID = entry.id
-        servers[index].name = entry.name
+        let launch = LaunchConfiguration(server: servers[index])
+        guard launch == LaunchConfiguration(entry: entry)
+            || entry.legacyLaunchConfigurations.contains(where: { LaunchConfiguration($0) == launch })
+        else { return }
         servers[index].command = entry.command
         servers[index].arguments = entry.arguments
         for name in entry.excludedEnvironment {

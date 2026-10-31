@@ -75,6 +75,63 @@ final class LocalModelDiscoveryTests: XCTestCase {
         XCTAssertFalse(model.capabilities.contains(.text))
     }
 
+    func testDiscoversFlux3RootPackageAsGenerationAndEditingModel() async throws {
+        let repoID = "black-forest-labs/flux-3-image-klein"
+        let snapshot = snapshotURL(repoID: repoID)
+        try writeJSON(
+            [
+                "model": "flux-3-image-klein",
+                "dit": ["in_channels": ["image": 128, "image_cond": 128, "text": 20480]],
+            ],
+            to: snapshot.appendingPathComponent("config.json")
+        )
+        for filename in [
+            "model.safetensors", "ae.safetensors", "text_encoder/config.json",
+            "text_encoder/tokenizer.json", "text_encoder/model.safetensors",
+        ] {
+            try write("{}", to: snapshot.appendingPathComponent(filename))
+        }
+
+        let models = try await LocalModelDiscovery.scan(searchPaths: searchPaths)
+        let model = try XCTUnwrap(models.first { $0.repoID == repoID })
+
+        XCTAssertEqual(model.provider, .blackForestLabs)
+        XCTAssertTrue(model.capabilities.contains(.imageGeneration))
+        XCTAssertTrue(model.capabilities.contains(.imageEditing))
+        XCTAssertFalse(model.capabilities.contains(.text))
+    }
+
+    func testDiscoversMOSSImagePipelineAsGenerationOnlyModel() async throws {
+        let repoID = "OpenMOSS-Team/MOSS-Image-SFT"
+        let snapshot = snapshotURL(repoID: repoID)
+        try writeJSON(
+            [
+                "_class_name": "MOSSImagePipeline",
+                "transformer": ["pipeline_moss_image", "MOSSImageTransformer2DModel"],
+                "vae": ["diffusers", "AutoencoderKLFlux2"],
+            ],
+            to: snapshot.appendingPathComponent("model_index.json")
+        )
+        for component in ["transformer", "text_encoder", "vae"] {
+            try writeJSON([:], to: snapshot.appendingPathComponent("\(component)/config.json"))
+            try write("weights", to: snapshot.appendingPathComponent("\(component)/model.safetensors"))
+        }
+        try writeJSON(
+            ["_class_name": "AutoencoderKLFlux2"],
+            to: snapshot.appendingPathComponent("vae/config.json")
+        )
+        try writeJSON([:], to: snapshot.appendingPathComponent("scheduler/scheduler_config.json"))
+        try writeJSON([:], to: snapshot.appendingPathComponent("tokenizer/tokenizer.json"))
+
+        let models = try await LocalModelDiscovery.scan(searchPaths: searchPaths)
+        let model = try XCTUnwrap(models.first { $0.repoID == repoID })
+
+        XCTAssertEqual(model.provider, .openMOSS)
+        XCTAssertTrue(model.capabilities.contains(.imageGeneration))
+        XCTAssertFalse(model.capabilities.contains(.imageEditing))
+        XCTAssertFalse(model.capabilities.contains(.text))
+    }
+
     func testDiscoversModelFromAdditionalSearchFolder() async throws {
         let externalModel = temporaryCache.appendingPathComponent(
             "external/owner/model",
@@ -98,6 +155,87 @@ final class LocalModelDiscoveryTests: XCTestCase {
         XCTAssertTrue(model.capabilities.contains(.text))
     }
 
+    func testNemotronOmniModelsAreSelectableAndNotRejectedAtStartup() async throws {
+        let repoIDs = [
+            "nativ-community/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-NVFP4",
+            "nativ-community/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4",
+        ]
+        for repoID in repoIDs {
+            try makeTextModelSnapshot(
+                repoID: repoID,
+                modelType: "nemotron_h_omni",
+                architectures: ["NemotronH_Omni_Reasoning_V3"],
+                sentenceTransformer: false
+            )
+        }
+        let models = try await LocalModelDiscovery.scan(searchPaths: searchPaths)
+        XCTAssertEqual(models.count, repoIDs.count)
+        for model in models {
+            XCTAssertTrue(model.capabilities.contains(.text), model.repoID)
+            XCTAssertTrue(model.isEligibleForLanguageModelPicker, model.repoID)
+            XCTAssertFalse(LocalModelDiscovery.isKnownNonLanguageModel(
+                repoID: model.repoID, searchPaths: searchPaths.all
+            ))
+        }
+    }
+
+    func testSparkTTSPreservesSpeechRoleWithQwen2Backbone() async throws {
+        let repoID = "mlx-community/Spark-TTS-0.5B-bf16"
+        try makeTextModelSnapshot(
+            repoID: repoID,
+            modelType: "qwen2",
+            architectures: ["Qwen2ForCausalLM"],
+            sentenceTransformer: false
+        )
+
+        let models = try await LocalModelDiscovery.scan(searchPaths: searchPaths)
+        let model = try XCTUnwrap(models.first { $0.repoID == repoID })
+
+        XCTAssertTrue(model.capabilities.contains(.textToSpeech))
+        XCTAssertFalse(model.capabilities.contains(.text))
+        XCTAssertFalse(model.isEligibleForLanguageModelPicker)
+    }
+
+    func testNemotronStreamingRemainsSpeechToText() async throws {
+        let repoID = "nvidia/nemotron-speech-streaming-en-0.6b"
+        try makeTextModelSnapshot(
+            repoID: repoID,
+            modelType: "nemotron_asr_streaming",
+            architectures: ["NemotronAsrStreamingForRNNT"],
+            sentenceTransformer: false
+        )
+
+        let models = try await LocalModelDiscovery.scan(searchPaths: searchPaths)
+        let model = try XCTUnwrap(models.first { $0.repoID == repoID })
+
+        XCTAssertTrue(model.capabilities.contains(.speechToText))
+        XCTAssertEqual(
+            LocalModelDiscovery.speechToTextModelID(in: models, selectedModelID: repoID),
+            repoID
+        )
+    }
+
+    func testStartupRejectsEncoderFromAdditionalRootAndDirectPath() async throws {
+        try makeTextModelSnapshot(
+            repoID: "org/encoder", modelType: "bert",
+            architectures: ["BertModel"], sentenceTransformer: false
+        )
+        let models = try await LocalModelDiscovery.scan(searchPaths: searchPaths)
+        let model = try XCTUnwrap(models.first)
+        XCTAssertFalse(model.isEligibleForLanguageModelPicker)
+        XCTAssertTrue(model.capabilities.contains(.embeddings))
+        XCTAssertFalse(model.isEligibleForLanguageModelPicker)
+        let snapshot = try XCTUnwrap(model.snapshotURL)
+        for repoID in [model.repoID, snapshot.path] {
+            XCTAssertTrue(LocalModelDiscovery.isKnownNonLanguageModel(
+                repoID: repoID, searchPaths: [temporaryCache.appendingPathComponent("missing").path, temporaryCache.path]
+            ))
+        }
+        XCTAssertFalse(LocalModelDiscovery.isKnownNonLanguageModel(
+            repoID: "org/missing", searchPaths: searchPaths.all
+        ))
+    }
+
     func testClassifiesEncoderWithPoolingAsEmbeddingModel() async throws {
         try makeTextModelSnapshot(
             repoID: "org/xlm-roberta-embed",
@@ -109,6 +247,7 @@ final class LocalModelDiscoveryTests: XCTestCase {
         let models = try await LocalModelDiscovery.scan(searchPaths: searchPaths)
         let model = try XCTUnwrap(models.first)
         XCTAssertTrue(model.capabilities.contains(.embeddings))
+        XCTAssertFalse(model.isEligibleForLanguageModelPicker)
     }
 
     func testDoesNotClassifyCausalLanguageModelAsEmbeddingModel() async throws {
@@ -152,6 +291,7 @@ final class LocalModelDiscoveryTests: XCTestCase {
         let models = try await LocalModelDiscovery.scan(searchPaths: searchPaths)
         let model = try XCTUnwrap(models.first)
         XCTAssertTrue(model.capabilities.contains(.embeddings))
+        XCTAssertFalse(model.isEligibleForLanguageModelPicker)
     }
 
     func testClassifiesStampedModelAsEmbeddingModel() async throws {
@@ -166,6 +306,7 @@ final class LocalModelDiscoveryTests: XCTestCase {
         let models = try await LocalModelDiscovery.scan(searchPaths: searchPaths)
         let model = try XCTUnwrap(models.first)
         XCTAssertTrue(model.capabilities.contains(.embeddings))
+        XCTAssertFalse(model.isEligibleForLanguageModelPicker)
     }
 
     func testRequiresEveryShardReferencedBySafetensorsIndex() async throws {

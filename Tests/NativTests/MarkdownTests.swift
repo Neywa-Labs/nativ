@@ -3,6 +3,17 @@ import SwiftUI
 import XCTest
 
 final class MarkdownParserTests: XCTestCase {
+    func testSourcePreviewKeepsIndentedFencesAndImagesInsideCode() {
+        for indentation in ["", " ", "  ", "   ", "\t"] {
+            for fence in ["```", "````", "``````"] {
+                let source = indentation + fence + "\n![image](https://example.invalid/image.png)"
+                let nodes = MarkdownParser.parse(ChatWorkDocument.sourcePreview(source, language: "text"))
+                XCTAssertEqual(nodes.map(\.kind), ["code_block"])
+                XCTAssertEqual(nodes.first?.literal, source + "\n")
+            }
+        }
+    }
+
     func testGFMStructureReferencesAndLiteralCode() throws {
         let nodes = MarkdownParser.parse(
             """
@@ -47,6 +58,52 @@ final class MarkdownParserTests: XCTestCase {
 
 @MainActor
 final class MarkdownGeometryTests: XCTestCase {
+    func testClosingRenderedDocumentReleasesSurfaceAndTextViews() async throws {
+        weak var releasedSurface: MarkdownSurface?
+        weak var releasedText: MarkdownSelectableTextView?
+        autoreleasepool {
+            let window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 600, height: 400),
+                                  styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            let surface = MarkdownSurface()
+            surface.configure(content: "```swift\nlet value = 42\n```", style: .init())
+            surface.frame = CGRect(origin: .zero, size: surface.preflight(width: 600).size)
+            window.contentView = surface
+            surface.refreshVisibleBlocks()
+            XCTAssertFalse(surface.visibleTextViews.isEmpty)
+            releasedSurface = surface
+            releasedText = surface.visibleTextViews.first
+            window.contentView = nil
+            window.close()
+        }
+        // AppKit may defer teardown until the next event-loop turn.
+        for _ in 0..<5 where releasedText != nil {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        XCTAssertNil(releasedSurface)
+        XCTAssertNil(releasedText)
+    }
+
+    func testInternalLinksReachTheCurrentSurfaceHandler() throws {
+        let url = try XCTUnwrap(URL(string: "nativ://recording/passage/source"))
+        let surface = MarkdownSurface()
+        surface.configure(content: "[Source](\(url.absoluteString))", style: .init())
+        let layout = surface.preflight(width: 600)
+        let fragment = try XCTUnwrap(layout.blocks.first?.text.first)
+        XCTAssertEqual(fragment.text.attribute(.link, at: 0, effectiveRange: nil) as? URL, url)
+        let view = MarkdownSelectableTextView(fragment: fragment)
+        view.document = surface.selection
+        var opened: [URL] = []
+        surface.onOpenLink = { opened.append($0); return true }
+        view.clicked(onLink: url, at: 0)
+        XCTAssertEqual(opened, [url])
+        surface.onOpenLink = { _ in opened.removeAll(); return true }
+        view.clicked(onLink: url.absoluteString, at: 0)
+        XCTAssertTrue(opened.isEmpty, "Mounted text must use the latest callback")
+        surface.onOpenLink = nil
+        XCTAssertFalse(surface.selection.openLink(url), "Unclaimed links retain native behavior")
+    }
+
     func testMovingAncestorIntoViewportMountsTextWithoutScrolling() async throws {
         let window = NSWindow(
             contentRect: CGRect(x: 0, y: 0, width: 700, height: 500), styleMask: [.titled],

@@ -16,6 +16,8 @@ concurrency:
 jobs:
   build:
     runs-on: macos-26
+    env:
+      XCODE_DERIVED_DATA: build/NativDevelopmentDerivedData
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -32,28 +34,65 @@ jobs:
       - name: Test request diagnostics
         run: python3 -m unittest discover -s scripts/tests -p 'test_request_diagnostics*.py' -v
 
+      - name: Test runtime build and model capability detection
+        run: python3 -m unittest scripts.tests.test_python_resource_reuse scripts.tests.test_model_capabilities -v
+
       - name: Cache bundled mlx-vlm server distribution
         uses: actions/cache@v4
         with:
           path: |
-            dist/mlx-vlm-server
+            ${{ env.XCODE_DERIVED_DATA }}/Build/Products/Debug/NativServerKit.framework/Versions/A/Resources/mlx-vlm-server
             .cache/python-build-standalone
           key: mlx-vlm-server-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('PythonDistribution/**') }}
 
       - name: Cache Swift package dependencies
         uses: actions/cache@v4
         with:
-          path: build/XcodeDerivedData/SourcePackages
-          key: spm-${{ runner.os }}-${{ hashFiles('project.yml') }}
+          path: ${{ env.XCODE_DERIVED_DATA }}/SourcePackages
+          key: spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Nativ.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: |
+            spm-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build app (unsigned Debug)
-        run: make xcode-build
-
-      - name: Test software update channels and hardware history
+      - name: Build app and run targeted regression tests (unsigned Debug)
         run: |
+          make xcode-generate
           xcodebuild -project Nativ.xcodeproj -scheme Nativ -configuration Debug \
-            -derivedDataPath build/NativDevelopmentDerivedData \
-            CODE_SIGNING_ALLOWED=NO NATIV_SKIP_PYTHON_RESOURCE_BUILD=YES \
+            -derivedDataPath "$XCODE_DERIVED_DATA" -showBuildTimingSummary \
+            CODE_SIGNING_ALLOWED=NO NATIV_PRODUCT_NAME=Nativ COMPILER_INDEX_STORE_ENABLE=NO \
             -only-testing:NativTests/SoftwareUpdaterTests \
+            -only-testing:NativTests/MCPClientTests \
+            -only-testing:NativTests/MCPProjectFilesystemTests \
+            -only-testing:NativTests/MCPFilesystemSafetyTests \
+            -only-testing:NativTests/MCPServerCatalogTests \
+            -only-testing:NativTests/ChatProjectStoreTests \
+            -only-testing:NativTests/ChatCompactionTests \
+            -only-testing:NativTests/ArtifactCatalogTests \
+            -only-testing:NativTests/ArtifactRefreshTests \
+            -only-testing:NativTests/ArtifactDeletionTests \
+            -only-testing:NativTests/ArtifactFileIndexTests \
+            -only-testing:NativTests/ChatFileWriteToolTests \
+            -only-testing:NativTests/ChatReadFileToolTests \
+            -only-testing:NativTests/AudioAnalyticsStoreTests \
+            -only-testing:NativTests/AudioPlaybackStateTests \
+            -only-testing:NativTests/NativAudioClientTests \
+            -only-testing:NativTests/AudioDiarizationTests \
+            -only-testing:NativTests/AudioDiarizationStorageTests \
+            -only-testing:NativTests/AudioSpeakerProfileTests \
+            -only-testing:NativTests/AudioLibraryFilterTests \
+            -only-testing:NativTests/AudioRecordExportTests \
+            -only-testing:NativTests/AudioSummaryReferenceTests \
+            -only-testing:NativTests/AudioSummaryDocumentTests \
+            -only-testing:NativTests/MarkdownParserTests \
+            -only-testing:NativTests/MarkdownGeometryTests \
+            -only-testing:NativTests/MarkdownSelectionTests \
+            -only-testing:NativTests/ModelPrimaryTaskResolverTests \
+            -only-testing:NativTests/LocalModelDiscoveryTests \
+            -only-testing:NativTests/HuggingFaceModelSupportTests \
+            -only-testing:NativTests/MLXImageModelResolverTests \
+            -only-testing:NativTests/NativModelTypeRegistryDrafterTests \
+            -only-testing:NativTests/ChatResponseSpeechTests \
+            -only-testing:NativTests/NativAudioSpeechClientTests \
+            -only-testing:NativTests/HuggingFaceCapabilityFilterTests \
             -only-testing:NativTests/SystemTelemetryTests \
+            -only-testing:NativTests/SystemMonitorIdentityTests \
             -only-testing:NativTests/SystemMonitorObservationPolicyTests test
