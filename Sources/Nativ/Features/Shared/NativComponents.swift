@@ -11,6 +11,7 @@ struct NativArrowlessPopoverPresenter<Content: View>: NSViewRepresentable {
     var showsBorder: Bool = true
     var isInteractive: Bool = true
     var anchorTogglesPresentation: Bool = false
+    var drawsSurface: Bool = true
     @ViewBuilder let content: () -> Content
 
     func makeCoordinator() -> Coordinator {
@@ -33,6 +34,7 @@ struct NativArrowlessPopoverPresenter<Content: View>: NSViewRepresentable {
             showsBorder: showsBorder,
             isInteractive: isInteractive,
             anchorTogglesPresentation: anchorTogglesPresentation,
+            drawsSurface: drawsSurface,
             content: content
         )
     }
@@ -64,6 +66,7 @@ struct NativArrowlessPopoverPresenter<Content: View>: NSViewRepresentable {
             showsBorder: Bool,
             isInteractive: Bool,
             anchorTogglesPresentation: Bool,
+            drawsSurface: Bool,
             content: () -> Content
         ) {
             self.anchorView = anchorView
@@ -79,8 +82,15 @@ struct NativArrowlessPopoverPresenter<Content: View>: NSViewRepresentable {
             }
 
             let surface = ArrowlessPopoverSurface(content: content(), showsBorder: showsBorder,
-                                                  cornerRadius: cornerRadius,
-                                                  usesNativeShadow: anchorTogglesPresentation)
+                                                 cornerRadius: cornerRadius, usesNativeShadow: anchorTogglesPresentation,
+                                                 drawsSurface: drawsSurface) { [weak self] in
+                // Content can resize from its own SwiftUI state without updating this representable.
+                // Re-anchor after layout so menus grow away from their trigger, not into the Dock.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.isPresented?.wrappedValue == true else { return }
+                    self.showPanel()
+                }
+            }
             if let hostingView {
                 hostingView.rootView = surface
             } else {
@@ -178,7 +188,9 @@ struct NativArrowlessPopoverPresenter<Content: View>: NSViewRepresentable {
             guard fittingSize.width > 0, fittingSize.height > 0 else { return }
 
             let wasVisible = panel.isVisible
-            panel.setContentSize(fittingSize)
+            if panel.contentView?.frame.size != fittingSize {
+                panel.setContentSize(fittingSize)
+            }
             positionPanel(relativeTo: anchorView, in: parentWindow, size: fittingSize)
 
             if panel.parent !== parentWindow {
@@ -226,6 +238,10 @@ struct NativArrowlessPopoverPresenter<Content: View>: NSViewRepresentable {
                     max(origin.x, visibleFrame.minX + 8 - shadowPadding),
                     visibleFrame.maxX - size.width - 8 + shadowPadding
                 )
+                origin.y = min(
+                    max(origin.y, visibleFrame.minY + 8 - shadowPadding),
+                    visibleFrame.maxY - size.height - 8 + shadowPadding
+                )
             }
             panel.setFrameOrigin(origin)
         }
@@ -265,15 +281,20 @@ private struct ArrowlessPopoverSurface<Content: View>: View {
     let showsBorder: Bool
     let cornerRadius: CGFloat
     var usesNativeShadow = false
+    let drawsSurface: Bool
+    let onSizeChange: () -> Void
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
 
-        content
-            .clipShape(shape)
+        Group {
+            if drawsSurface { content.clipShape(shape) }
+            else { content }
+        }
             .padding(usesNativeShadow ? 0 : Self.shadowPadding)
+            .onGeometryChange(for: CGSize.self) { $0.size } action: { _ in onSizeChange() }
             .background {
-                shape
+                if drawsSurface { shape
                     .fill(Color(nsColor: .textBackgroundColor))
                     .overlay {
                         if showsBorder {
@@ -283,7 +304,29 @@ private struct ArrowlessPopoverSurface<Content: View>: View {
                     .shadow(color: .black.opacity(usesNativeShadow ? 0 : 0.08), radius: Self.shadowRadius, x: 0, y: Self.shadowRadius / 3)
                     .padding(usesNativeShadow ? 0 : Self.shadowPadding)
                     .drawingGroup()
+                }
             }
+    }
+}
+
+/// Compact rows shared by the composer’s project and model pickers.
+struct NativPickerRow<Content: View>: View {
+    var isHighlighted = false
+    let action: () -> Void
+    @ViewBuilder let content: () -> Content
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8, content: content)
+                .padding(.horizontal, 8)
+                .frame(height: 26)
+                .background(isHighlighted || isHovering ? Color.primary.opacity(0.08) : .clear,
+                            in: RoundedRectangle(cornerRadius: 6))
+                .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
     }
 }
 

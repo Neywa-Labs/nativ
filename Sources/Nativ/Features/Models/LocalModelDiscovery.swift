@@ -100,6 +100,8 @@ struct LocalModel: Identifiable, Equatable, Sendable {
     let capabilities: Set<LocalModelCapability>
     let drafterKind: String?
     let hiddenSize: Int?
+    var drafterModelType: String? = nil
+    var hasBuiltInMTP = false
     var source: LocalModelSource = .huggingFaceCache
 
     var displayName: String {
@@ -840,7 +842,9 @@ enum LocalModelDiscovery {
                     fileManager: fileManager
                 ),
                 drafterKind: speculativeMetadata.drafterKind,
-                hiddenSize: speculativeMetadata.hiddenSize
+                hiddenSize: speculativeMetadata.hiddenSize,
+                drafterModelType: speculativeMetadata.modelType,
+                hasBuiltInMTP: speculativeMetadata.hasBuiltInMTP
             )
         }
 
@@ -950,6 +954,8 @@ enum LocalModelDiscovery {
             ),
             drafterKind: speculativeMetadata.drafterKind,
             hiddenSize: speculativeMetadata.hiddenSize,
+            drafterModelType: speculativeMetadata.modelType,
+            hasBuiltInMTP: speculativeMetadata.hasBuiltInMTP,
             source: .external
         )
     }
@@ -1922,20 +1928,52 @@ enum LocalModelDiscovery {
     private static func speculativeMetadata(
         at snapshotURL: URL,
         fileManager: FileManager
-    ) -> (drafterKind: String?, hiddenSize: Int?) {
+    ) -> (drafterKind: String?, hiddenSize: Int?, modelType: String?, hasBuiltInMTP: Bool) {
         let configURL = snapshotURL.appendingPathComponent("config.json")
         guard fileManager.fileExists(atPath: configURL.path),
               let data = try? Data(contentsOf: configURL),
               let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
-            return (nil, nil)
+            return (nil, nil, nil, false)
         }
-        return (
-            MLXDrafterModelResolver.shared.metadata(
-                for: DrafterModelConfiguration(config: config)
-            )?.kind,
-            hiddenSize(in: config)
+        let metadata = MLXDrafterModelResolver.shared.metadata(
+            for: DrafterModelConfiguration(config: config)
         )
+        return (
+            metadata?.kind,
+            hiddenSize(in: config),
+            metadata?.loaderModelType,
+            hasBuiltInMTP(at: snapshotURL, config: config, fileManager: fileManager)
+        )
+    }
+
+    private static func hasBuiltInMTP(
+        at snapshotURL: URL, config: [String: Any], fileManager: FileManager
+    ) -> Bool {
+        // These families use the bundled Qwen MTP splitter. Config flags alone
+        // aren't enough: many conversions omit the actual MTP tensors.
+        guard let modelType = config["model_type"] as? String,
+              ["qwen3_5", "qwen3_5_moe", "qwen3_next"].contains(modelType) else { return false }
+        let indexURL = snapshotURL.appendingPathComponent("model.safetensors.index.json")
+        if let data = try? Data(contentsOf: indexURL),
+           let index = try? JSONDecoder().decode(SafetensorsShardIndex.self, from: data),
+           index.weightMap.contains(where: {
+               $0.key.hasPrefix("mtp.") && fileManager.fileExists(atPath: snapshotURL.appendingPathComponent($0.value).path)
+           }) { return true }
+
+        // Inspect only the JSON header, never load model weights while scanning.
+        let files = (try? fileManager.contentsOfDirectory(at: snapshotURL, includingPropertiesForKeys: nil)) ?? []
+        return files.filter { $0.pathExtension == "safetensors" }.contains { file in
+            guard let handle = try? FileHandle(forReadingFrom: file) else { return false }
+            defer { try? handle.close() }
+            guard let lengthData = try? handle.read(upToCount: 8), lengthData.count == 8 else { return false }
+            let length = lengthData.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(as: UInt64.self)) }
+            guard length > 0, length <= 16 * 1024 * 1024,
+                  let data = try? handle.read(upToCount: Int(length)), data.count == Int(length),
+                  let header = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { return false }
+            return header.keys.contains { $0.hasPrefix("mtp.") }
+        }
     }
 
     private static func modelProvider(

@@ -686,6 +686,9 @@ struct ModelConfigurationView: View {
                 true
             )
         }
+        if selected.hasBuiltInMTP, settings.draftKind == "mtp" {
+            return ("Uses the model’s built-in MTP weights. No separate draft model download needed.", false)
+        }
         if let kindLabel = selected.drafterKindLabel {
             return ("Detected \(kindLabel) drafter. Loaded on the next request. Changes to draft block size require a server restart.", false)
         }

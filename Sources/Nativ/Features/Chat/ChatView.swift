@@ -710,23 +710,14 @@ private struct ChatProjectPickerRow: View {
     let icon: String
     var selected = false
     let action: () -> Void
-    @State private var isHovering = false
 
     var body: some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                Image(systemName: icon).foregroundStyle(.secondary).frame(width: 14)
-                Text(title).lineLimit(1).truncationMode(.middle)
-                Spacer(minLength: 4)
-                if selected { Image(systemName: "checkmark").fontWeight(.medium) }
-            }
-            .padding(.horizontal, 8)
-            .frame(height: 26)
-            .background(isHovering ? Color.primary.opacity(0.08) : .clear, in: RoundedRectangle(cornerRadius: 6))
-            .contentShape(.rect)
+        NativPickerRow(action: action) {
+            Image(systemName: icon).foregroundStyle(.secondary).frame(width: 14)
+            Text(title).lineLimit(1).truncationMode(.middle)
+            Spacer(minLength: 4)
+            if selected { Image(systemName: "checkmark").fontWeight(.medium) }
         }
-        .buttonStyle(.plain)
-        .onHover { isHovering = $0 }
         .accessibilityValue(selected ? "Selected" : "")
     }
 }

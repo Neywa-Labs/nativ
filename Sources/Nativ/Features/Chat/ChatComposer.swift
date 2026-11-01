@@ -698,7 +698,6 @@ struct ChatComposer<ContextHeader: View>: View {
                 : nil,
             showsFastIndicator: model.settings.speculativeDecodingActive,
             secondarySections: modelPickerSecondarySections,
-            secondarySectionsForModel: modelPickerSecondarySections(for:),
             isModelLoading: model.isModelLoading,
             modelLoadingPercentage: model.modelLoadingPercentage,
             isDisabled: model.isModelLoading || viewModel.hasPendingRequests
@@ -775,7 +774,7 @@ struct ChatComposer<ContextHeader: View>: View {
             components.append("reasoning \(reasoningLevel.rawValue)")
         }
         if model.settings.speculativeDecodingActive {
-            components.append("speed Fast")
+            components.append("speed \(modelPickerSecondarySections.first { $0.id == "drafter" }?.selectedLabel ?? "Fast")")
         }
         let value = components.joined(separator: ", ")
         guard model.isModelLoading, let percentage = model.modelLoadingPercentage else {
@@ -1012,15 +1011,6 @@ struct ChatComposer<ContextHeader: View>: View {
     }
 
     private func modelPickerSecondarySections(
-        for modelID: String
-    ) -> [ComposerModelPickerSecondarySection] {
-        modelPickerSecondarySections(
-            for: modelID,
-            profile: modelPickerProfile(for: modelID)
-        )
-    }
-
-    private func modelPickerSecondarySections(
         for modelID: String,
         profile: ModelConfigProfile
     ) -> [ComposerModelPickerSecondarySection] {
@@ -1028,19 +1018,6 @@ struct ChatComposer<ContextHeader: View>: View {
             drafterPickerSection(for: modelID, profile: profile),
             reasoningPickerSection(for: modelID, profile: profile),
         ].compactMap { $0 }
-    }
-
-    private func modelPickerProfile(for modelID: String) -> ModelConfigProfile {
-        if modelID == selectedModelID {
-            return model.settings.currentModelProfile
-        }
-        if let profile = model.settings.modelProfile(for: modelID) {
-            return profile
-        }
-        let supportsReasoning = localLibrary.models.first {
-            $0.repoID == modelID
-        }?.capabilities.contains(.reasoning) == true
-        return ModelConfigProfile(thinkingEnabled: supportsReasoning)
     }
 
     private func modelSupportsThinking(
@@ -1070,45 +1047,24 @@ struct ChatComposer<ContextHeader: View>: View {
         let activeDraftModelID = speculativeDecodingActive(in: profile)
             ? profile.draftModelID
             : ""
-        var options = [
-            ComposerModelPickerSecondaryOption(id: "", title: "Normal", detail: "")
-        ]
-        options.append(contentsOf: compatibleDrafters.map { drafter in
-            ComposerModelPickerSecondaryOption(
-                id: drafter.repoID,
-                title: modelMenuLabel(drafter.repoID),
-                detail: drafter.drafterKindLabel ?? "Drafter",
-                summaryTitle: "Fast"
-            )
-        })
+        let options = ComposerModelPickerSecondaryOption.speedOptions(
+            drafters: compatibleDrafters, activeID: activeDraftModelID, activeKind: profile.draftKind,
+            target: localLibrary.models.first { $0.repoID == modelID }
+        )
 
-        if !activeDraftModelID.isEmpty,
-           !options.contains(where: { $0.id == activeDraftModelID }) {
-            options.insert(
-                ComposerModelPickerSecondaryOption(
-                    id: activeDraftModelID,
-                    title: modelMenuLabel(activeDraftModelID),
-                    detail: "Current",
-                    summaryTitle: "Fast"
-                ),
-                at: 1
-            )
-        }
-
-        let hasCompatibleDrafters = !compatibleDrafters.isEmpty
+        let hasCompatibleDrafters = options.contains { !$0.id.isEmpty && $0.isEnabled }
+        let needsDrafters = !hasCompatibleDrafters || options.contains { !$0.isEnabled }
         return ComposerModelPickerSecondarySection(
             id: "drafter",
             title: "Speed",
             selectedID: activeDraftModelID,
-            selectedLabel: activeDraftModelID.isEmpty
-                ? "Normal"
-                : "Fast",
+            selectedLabel: options.first { $0.id == activeDraftModelID }?.title ?? "Off",
             options: options,
             statusTitle: !hasCompatibleDrafters && localLibrary.isScanning
                 ? "Scanning for drafters…"
                 : nil,
-            actionTitle: !hasCompatibleDrafters && !localLibrary.isScanning
-                ? "Find Draft Models..."
+            actionTitle: needsDrafters && !localLibrary.isScanning
+                ? "Find Draft Models"
                 : nil,
             onAction: {
                 onFindDraftModels(modelID)
@@ -1160,14 +1116,15 @@ struct ChatComposer<ContextHeader: View>: View {
             }) else {
                 return
             }
+            let kind = drafter.hasBuiltInMTP && drafter.repoID == selectedModelID ? "mtp" : drafter.drafterKind ?? "auto"
             guard !settings.speculativeDecodingActive
                     || settings.draftModelID != drafter.repoID
-                    || settings.draftKind != drafter.drafterKind
+                    || settings.draftKind != kind
             else {
                 return
             }
             settings.draftModelID = drafter.repoID
-            settings.draftKind = drafter.drafterKind ?? "auto"
+            settings.draftKind = kind
             settings.speculativeDecodingEnabled = true
             settings.structuredOutputEnabled = false
             settings.thinkingBudgetEnabled = false
@@ -1713,61 +1670,7 @@ private struct ChatAccessComparison: View {
     }
 }
 
-struct ComposerModelPickerSecondaryOption: Identifiable {
-    let id: String
-    let title: String
-    let detail: String
-    let summaryTitle: String?
-
-    init(
-        id: String,
-        title: String,
-        detail: String,
-        summaryTitle: String? = nil
-    ) {
-        self.id = id
-        self.title = title
-        self.detail = detail
-        self.summaryTitle = summaryTitle
-    }
-}
-
-struct ComposerModelPickerSecondarySection: Identifiable {
-    let id: String
-    let title: String
-    let selectedID: String
-    let selectedLabel: String
-    let options: [ComposerModelPickerSecondaryOption]
-    let statusTitle: String?
-    let actionTitle: String?
-    let onAction: (() -> Void)?
-    let onSelect: (String) -> Void
-
-    init(
-        id: String,
-        title: String,
-        selectedID: String,
-        selectedLabel: String,
-        options: [ComposerModelPickerSecondaryOption],
-        statusTitle: String? = nil,
-        actionTitle: String? = nil,
-        onAction: (() -> Void)? = nil,
-        onSelect: @escaping (String) -> Void
-    ) {
-        self.id = id
-        self.title = title
-        self.selectedID = selectedID
-        self.selectedLabel = selectedLabel
-        self.options = options
-        self.statusTitle = statusTitle
-        self.actionTitle = actionTitle
-        self.onAction = onAction
-        self.onSelect = onSelect
-    }
-}
-
 struct ComposerModelPicker: View {
-    @Environment(\.colorScheme) private var colorScheme
     @State private var isPickerHovered = false
     @State private var isMenuOpen = false
 
@@ -1778,7 +1681,6 @@ struct ComposerModelPicker: View {
     let selectedModelDetail: String?
     let showsFastIndicator: Bool
     let secondarySections: [ComposerModelPickerSecondarySection]
-    let secondarySectionsForModel: ((String) -> [ComposerModelPickerSecondarySection])?
     let isModelLoading: Bool
     let modelLoadingPercentage: Int?
     let isDisabled: Bool
@@ -1792,51 +1694,42 @@ struct ComposerModelPicker: View {
     let onSwitchModel: (String) -> Void
 
     var body: some View {
-        ZStack {
+        Button { isMenuOpen.toggle() } label: {
             pickerLabel
-                .opacity(0)
-
-            ComposerModelPickerMenuControl(
-                models: models,
-                selectedModelID: selectedModelID,
-                selectedModelLabel: selectedModelLabel,
-                selectedModelProvider: selectedModelProvider,
-                secondarySections: secondarySections,
-                secondarySectionsForModel: secondarySectionsForModel,
-                isEnabled: !isDisabled,
-                usesSelectModelShortcut: shortcutLabel != nil,
-                statusLabel: statusLabel,
-                emptyStateActionTitle: emptyStateActionTitle,
-                onEmptyStateAction: onEmptyStateAction,
-                onSelectModel: onSelectModel,
-                onSwitchModel: onSwitchModel,
-                onTrackingChanged: { isTracking in
-                    isMenuOpen = isTracking
-                    if !isTracking {
-                        isPickerHovered = false
-                    }
-                }
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            // The native control owns interaction while this stable SwiftUI copy
-            // preserves the provider logo and exact composer styling.
-            pickerLabel
-                .background {
-                    Capsule()
-                        .fill(isPickerActive ? pickerHighlightColor : pickerRestingColor)
-                }
-                .allowsHitTesting(false)
+                .background(
+                    Color.primary.opacity(isMenuOpen ? 0.1 : isPickerHovered ? 0.06 : 0),
+                    in: RoundedRectangle(cornerRadius: 6)
+                )
+                .contentShape(.rect)
         }
+        .buttonStyle(.plain)
+        .keyboardShortcut(shortcutLabel == nil ? nil : KeyboardShortcut("m", modifiers: [.control, .shift]))
         .fixedSize()
         .frame(height: 32)
         .background {
             NativArrowlessPopoverPresenter(
-                isPresented: tooltipPresentation,
-                gap: 10,
-                // The tooltip's transparent shadow overlaps the hover target.
-                // Let mouse events pass through so it cannot dismiss itself.
-                isInteractive: false
+                isPresented: $isMenuOpen, gap: 14, alignment: .trailing,
+                cornerRadius: 14, title: "Choose model", drawsSurface: false
+            ) {
+                ComposerModelPickerMenu(
+                    models: models,
+                    selectedModelID: selectedModelID,
+                    selectedModelLabel: selectedModelLabel,
+                    selectedModelProvider: selectedModelProvider,
+                    secondarySections: secondarySections,
+                    isEnabled: !isDisabled,
+                    statusLabel: statusLabel,
+                    emptyStateActionTitle: emptyStateActionTitle,
+                    onEmptyStateAction: onEmptyStateAction,
+                    onSelectModel: selectModel,
+                    onDismiss: { isMenuOpen = false }
+                )
+            }
+            .id(isMenuOpen)
+        }
+        .background {
+            NativArrowlessPopoverPresenter(
+                isPresented: tooltipPresentation, gap: 10, isInteractive: false
             ) {
                 ComposerModelPickerTooltip(
                     title: pickerTooltip,
@@ -1844,15 +1737,23 @@ struct ComposerModelPicker: View {
                 )
             }
         }
-        .contentShape(Capsule())
         .disabled(isDisabled)
-        .onHover { hovering in
-            guard !isMenuOpen else { return }
-            isPickerHovered = hovering
+        .onHover { isPickerHovered = $0 }
+        .onChange(of: isMenuOpen) { _, isOpen in
+            if !isOpen { isPickerHovered = false }
         }
-        .animation(.easeOut(duration: 0.1), value: isPickerActive)
         .accessibilityLabel("Model")
         .accessibilityValue(accessibilityValue)
+    }
+
+    private func selectModel(_ modelID: String) {
+        guard !isDisabled else { return }
+        isMenuOpen = false
+        if let model = models.first(where: { $0.repoID == modelID }) {
+            onSelectModel(model)
+        } else {
+            onSwitchModel(modelID)
+        }
     }
 
     private var pickerLabel: some View {
@@ -1877,400 +1778,436 @@ struct ComposerModelPicker: View {
         )
     }
 
-    private var isPickerActive: Bool {
-        isPickerHovered || isMenuOpen
-    }
-
-    private var pickerHighlightColor: Color {
-        colorScheme == .light
-            ? Color.black.opacity(0.08)
-            : Color.white.opacity(0.14)
-    }
-
-    private var pickerRestingColor: Color {
-        Color(nsColor: .textBackgroundColor)
-    }
-
 }
 
-private struct ComposerModelPickerMenuControl: NSViewRepresentable {
+private struct ComposerModelPickerMenu: View {
     let models: [LocalModel]
     let selectedModelID: String?
     let selectedModelLabel: String
     let selectedModelProvider: LocalModelProvider?
     let secondarySections: [ComposerModelPickerSecondarySection]
-    let secondarySectionsForModel: ((String) -> [ComposerModelPickerSecondarySection])?
     let isEnabled: Bool
-    let usesSelectModelShortcut: Bool
     let statusLabel: String
     let emptyStateActionTitle: String?
     let onEmptyStateAction: (() -> Void)?
-    let onSelectModel: (LocalModel) -> Void
-    let onSwitchModel: (String) -> Void
-    let onTrackingChanged: (Bool) -> Void
+    let onSelectModel: (String) -> Void
+    let onDismiss: () -> Void
+    @State private var search = ""
+    @State private var showsModelPicker = false
+    @State private var highlightedModelID: String?
+    @State private var showsSpeedPicker = false
+    @State private var isSpeedHovered = false
+    @State private var previewReasoningID: String?
+    @FocusState private var searchIsFocused: Bool
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(parent: self)
+    private var modelIDs: [String] {
+        let installedIDs = models.map(\.repoID)
+        if let selectedModelID, !installedIDs.contains(selectedModelID) {
+            return [selectedModelID] + installedIDs
+        }
+        return installedIDs
     }
 
-    func makeNSView(context: Context) -> NSButton {
-        let button = NSButton()
-        button.isBordered = false
-        button.title = ""
-        button.image = nil
-        button.focusRingType = .none
-        button.target = context.coordinator
-        button.action = #selector(Coordinator.showMenu(_:))
-        configureShortcut(for: button)
-        button.setAccessibilityLabel("Model")
-        return button
+    private var matches: [String] {
+        let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        return modelIDs.filter { query.isEmpty || $0.localizedStandardContains(query) }
     }
 
-    func updateNSView(_ button: NSButton, context: Context) {
-        context.coordinator.parent = self
-        button.isEnabled = isEnabled
-        configureShortcut(for: button)
-        context.coordinator.updateActionAvailability(isEnabled)
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if showsModelPicker {
+                modelPage
+                    .padding(4)
+                    .modifier(ComposerModelMenuSurface())
+            } else if showsSpeedPicker, let speedSection {
+                speedPage(speedSection)
+                    .frame(width: 270)
+                    .modifier(ComposerModelMenuSurface())
+            }
+            mainPage
+                .modifier(ComposerModelMenuSurface())
+        }
+        .font(.system(size: 12))
+        .frame(width: 360)
+        .background {
+            Color.clear.contentShape(.rect).onTapGesture { dismissSubmenu() }
+        }
+        .onExitCommand {
+            if showsSpeedPicker || showsModelPicker { dismissSubmenu() }
+            else { onDismiss() }
+        }
     }
 
-    private func configureShortcut(for button: NSButton) {
-        button.keyEquivalent = usesSelectModelShortcut ? "m" : ""
-        button.keyEquivalentModifierMask = usesSelectModelShortcut
-            ? [.control, .shift]
-            : []
+    private func dismissSubmenu() {
+        showsSpeedPicker = false
+        showsModelPicker = false
+        searchIsFocused = false
     }
 
-    @MainActor
-    final class Coordinator: NSObject {
-        var parent: ComposerModelPickerMenuControl
+    private var speedSection: ComposerModelPickerSecondarySection? {
+        secondarySections.first { $0.id == "drafter" }
+    }
 
-        private static let menuFont = NSFont.menuFont(ofSize: NSFont.systemFontSize)
-        private weak var modelSummaryItem: NSMenuItem?
-        private weak var presentedMenu: NSMenu?
-        private var presentedSecondarySections = [
-            String: ComposerModelPickerSecondarySection
-        ]()
-        private var secondarySummaryItems = [String: NSMenuItem]()
-        private var modelOptionViews = [PersistentMenuActionView]()
-        private var secondaryOptionViews = [String: [PersistentMenuActionView]]()
+    private var reasoningSection: ComposerModelPickerSecondarySection? {
+        secondarySections.first { $0.id == "reasoning" }
+    }
 
-        init(parent: ComposerModelPickerMenuControl) {
-            self.parent = parent
-        }
-
-        @objc func showMenu(_ sender: NSButton) {
-            // Build the entire tree before tracking begins. Keeping both submenus
-            // alive for the whole session prevents hover-driven view replacement.
-            modelOptionViews.removeAll()
-            secondarySummaryItems.removeAll()
-            secondaryOptionViews.removeAll()
-            let menu = makeMenu()
-            presentedMenu = menu
-            parent.onTrackingChanged(true)
-            defer {
-                presentedMenu = nil
-                presentedSecondarySections.removeAll()
-                parent.onTrackingChanged(false)
-            }
-            menu.update()
-            menu.popUp(
-                positioning: nil,
-                at: NSPoint(
-                    x: -8,
-                    y: sender.isFlipped
-                        ? sender.bounds.minY - menu.size.height - 4
-                        : sender.bounds.maxY + menu.size.height + 4
-                ),
-                in: sender
-            )
-        }
-
-        private func makeMenu() -> NSMenu {
-            let menu = NSMenu()
-            menu.autoenablesItems = false
-
-            let modelItem = NSMenuItem(
-                title: "Model   \(parent.selectedModelLabel)",
-                action: nil,
-                keyEquivalent: ""
-            )
-            modelItem.submenu = makeModelMenu()
-            menu.addItem(modelItem)
-            modelSummaryItem = modelItem
-
-            installSecondarySections(parent.secondarySections, in: menu)
-
-            return menu
-        }
-
-        private func installSecondarySections(
-            _ sections: [ComposerModelPickerSecondarySection],
-            in menu: NSMenu
-        ) {
-            for item in secondarySummaryItems.values {
-                menu.removeItem(item)
-            }
-            secondarySummaryItems.removeAll()
-            secondaryOptionViews.removeAll()
-            presentedSecondarySections.removeAll()
-
-            for secondarySection in sections {
-                let secondaryItem = NSMenuItem(
-                    title: "\(secondarySection.title)   \(secondarySection.selectedLabel)",
-                    action: nil,
-                    keyEquivalent: ""
-                )
-                secondaryItem.submenu = makeSecondaryMenu(secondarySection)
-                menu.addItem(secondaryItem)
-                secondarySummaryItems[secondarySection.id] = secondaryItem
-                presentedSecondarySections[secondarySection.id] = secondarySection
-            }
-        }
-
-        private func makeModelMenu() -> NSMenu {
-            let menu = NSMenu()
-            menu.autoenablesItems = false
-
-            if let selectedModelID = parent.selectedModelID,
-               !parent.models.contains(where: { $0.repoID == selectedModelID }) {
-                let item = modelItem(
-                    title: modelMenuLabel(selectedModelID),
-                    repoID: selectedModelID,
-                    provider: parent.selectedModelProvider,
-                    isSelected: true
-                )
-                menu.addItem(item)
-
-                if !parent.models.isEmpty {
-                    menu.addItem(.separator())
+    private var mainPage: some View {
+        VStack(spacing: 12) {
+            HStack(spacing: 8) {
+                if let speedSection { speedButton(speedSection) }
+                NativPickerRow(isHighlighted: showsModelPicker) {
+                    showsSpeedPicker = false
+                    showsModelPicker.toggle()
+                    searchIsFocused = showsModelPicker
+                } content: {
+                    Text(selectedModelLabel).fontWeight(.medium)
+                        .lineLimit(1).truncationMode(.middle)
+                    if let reasoningSection {
+                        Text(previewReasoningID ?? reasoningSection.selectedLabel)
+                            .foregroundStyle(.secondary).fixedSize()
+                    }
+                    Image(systemName: showsModelPicker ? "chevron.up" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+                }
+                .help("Choose model")
+                .accessibilityLabel("Choose model")
+                if let speedSection, !speedSection.selectedID.isEmpty {
+                    Text(speedSection.selectedLabel.uppercased())
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .padding(.horizontal, 5).padding(.vertical, 3)
+                        .background(.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 4))
+                        .accessibilityLabel("Speed: \(speedSection.selectedLabel)")
                 }
             }
-
-            for model in parent.models {
-                let item = modelItem(
-                    title: modelMenuLabel(model.repoID),
-                    repoID: model.repoID,
-                    provider: model.provider,
-                    isSelected: model.repoID == parent.selectedModelID
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if let reasoningSection, reasoningSection.options.count > 1 {
+                ComposerReasoningSlider(
+                    options: reasoningSection.options, selectedID: reasoningSection.selectedID,
+                    onPreview: { previewReasoningID = $0; dismissSubmenu() },
+                    onSelect: reasoningSection.onSelect
                 )
-                menu.addItem(item)
+                .frame(height: 30)
+                .disabled(!isEnabled)
+                .help("Reasoning: \(reasoningSection.selectedLabel)")
             }
+        }
+        .padding(12)
+    }
 
-            if parent.models.isEmpty && parent.selectedModelID == nil {
-                let item = NSMenuItem(title: parent.statusLabel, action: nil, keyEquivalent: "")
-                item.isEnabled = false
-                menu.addItem(item)
-
-                if let actionTitle = parent.emptyStateActionTitle,
-                   parent.onEmptyStateAction != nil {
-                    menu.addItem(.separator())
-                    let actionItem = NSMenuItem(
-                        title: actionTitle,
-                        action: #selector(performEmptyStateAction),
-                        keyEquivalent: ""
-                    )
-                    actionItem.target = self
-                    actionItem.isEnabled = true
-                    menu.addItem(actionItem)
+    private func speedButton(_ section: ComposerModelPickerSecondarySection) -> some View {
+        let active = !section.selectedID.isEmpty
+        let method = section.selectedOption?.speedMethod
+        let hasChoices = section.options.filter { !$0.id.isEmpty }.count > 1
+        return HStack(spacing: 0) {
+            Button {
+                dismissSubmenu()
+                if let option = section.speedToggleOption { section.onSelect(option.id) }
+                else if let action = section.onAction, section.actionTitle != nil { onDismiss(); action() }
+            } label: {
+                ZStack(alignment: .bottomTrailing) {
+                    ComposerLightningBolt()
+                        .fill(.foreground)
+                        .frame(width: 17, height: 17)
+                    if method?.rank == 2 {
+                        Text("+").font(.system(size: 8, weight: .bold)).offset(x: 5, y: 3)
+                    }
+                }
+                .foregroundStyle(active ? .primary : .secondary)
+                .frame(width: 32, height: 30)
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .disabled(!isEnabled || (section.speedToggleOption == nil && section.actionTitle == nil))
+            .accessibilityLabel(active ? "Turn speed off" : section.speedToggleOption != nil ? "Turn speed on" : "Find draft models")
+            .accessibilityValue(section.selectedLabel)
+            .onHover { isSpeedHovered = $0 }
+            .background {
+                NativArrowlessPopoverPresenter(
+                    isPresented: Binding(get: { isSpeedHovered && !showsSpeedPicker },
+                                         set: { isSpeedHovered = $0 }),
+                    gap: 8, alignment: .leading, cornerRadius: 8, isInteractive: false
+                ) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(active ? "\(section.selectedLabel) on" : "Speed off").fontWeight(.medium)
+                        Text(section.selectedOption?.detail ?? "Standard decoding").foregroundStyle(.secondary)
+                    }
+                    .font(.system(size: 11)).padding(8)
                 }
             }
-
-            return menu
-        }
-
-        @objc private func performEmptyStateAction() {
-            parent.onEmptyStateAction?()
-        }
-
-        private func makeSecondaryMenu(
-            _ section: ComposerModelPickerSecondarySection
-        ) -> NSMenu {
-            let menu = NSMenu()
-            menu.autoenablesItems = false
-
-            for option in section.options {
-                let title = secondaryOptionTitle(
-                    option,
-                    options: section.options
-                )
-                let item = persistentMenuItem(
-                    title: title,
-                    optionID: option.id,
-                    image: nil,
-                    isSelected: option.id == section.selectedID
-                ) { [weak self] in
-                    self?.selectSecondaryOption(option.id, sectionID: section.id)
+            if hasChoices {
+                Divider().frame(height: 20)
+                Button {
+                    showsModelPicker = false
+                    searchIsFocused = false
+                    showsSpeedPicker.toggle()
+                } label: {
+                    Image(systemName: showsSpeedPicker ? "chevron.down" : "chevron.up")
+                        .font(.system(size: 8, weight: .semibold))
+                        .frame(width: 18, height: 30).contentShape(.rect)
                 }
-                if let itemView = item.view as? PersistentMenuActionView {
-                    secondaryOptionViews[section.id, default: []].append(itemView)
+                .buttonStyle(.plain)
+                .disabled(!isEnabled)
+                .accessibilityLabel("Choose speed tier")
+            }
+        }
+        .background(.primary.opacity(active || showsSpeedPicker ? 0.08 : 0.04),
+                    in: RoundedRectangle(cornerRadius: 7))
+        .overlay { RoundedRectangle(cornerRadius: 7).strokeBorder(.primary.opacity(0.12), lineWidth: 0.5) }
+    }
+
+    private var modelPage: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Search models", text: $search)
+                    .textFieldStyle(.plain)
+                    .focused($searchIsFocused)
+                    .onSubmit {
+                        if isEnabled, let modelID = highlightedModelID ?? matches.first {
+                            onSelectModel(modelID)
+                        }
+                    }
+                    .onKeyPress(.downArrow) { moveHighlight(1); return .handled }
+                    .onKeyPress(.upArrow) { moveHighlight(-1); return .handled }
+                Button(action: dismissSubmenu) {
+                    Image(systemName: "xmark").foregroundStyle(.secondary)
                 }
-                menu.addItem(item)
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close model list")
             }
-
-            if let statusTitle = section.statusTitle {
-                menu.addItem(.separator())
-                let statusItem = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
-                statusItem.isEnabled = false
-                menu.addItem(statusItem)
-            } else if let actionTitle = section.actionTitle,
-                      section.onAction != nil {
-                menu.addItem(.separator())
-                let actionItem = NSMenuItem(
-                    title: actionTitle,
-                    action: #selector(performSecondaryAction(_:)),
-                    keyEquivalent: ""
-                )
-                actionItem.target = self
-                actionItem.representedObject = section.id
-                actionItem.isEnabled = true
-                menu.addItem(actionItem)
+            .font(.system(size: 11))
+            .padding(.horizontal, 8)
+            .frame(height: 30)
+            Group {
+                if matches.isEmpty {
+                    Text(modelIDs.isEmpty ? statusLabel : "No matching models")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            VStack(spacing: 0) {
+                                ForEach(matches, id: \.self) { modelID in
+                                    NativPickerRow(isHighlighted: highlightedModelID == modelID) {
+                                        onSelectModel(modelID)
+                                    } content: {
+                                        ChatComposerModelIcon(provider: models.first { $0.repoID == modelID }?.provider
+                                                              ?? (modelID == selectedModelID ? selectedModelProvider : nil))
+                                        Text(LocalModel.displayTitle(for: modelID))
+                                            .lineLimit(1).truncationMode(.middle)
+                                        Spacer(minLength: 4)
+                                        if modelID == selectedModelID {
+                                            Image(systemName: "checkmark").fontWeight(.medium)
+                                        }
+                                    }
+                                    .id(modelID)
+                                    .disabled(!isEnabled)
+                                    .help(modelID)
+                                    .accessibilityValue(modelID == selectedModelID ? "Selected" : "")
+                                }
+                            }
+                        }
+                        .onChange(of: highlightedModelID) { _, modelID in
+                            if let modelID { proxy.scrollTo(modelID) }
+                        }
+                    }
+                }
             }
-
-            return menu
-        }
-
-        @objc private func performSecondaryAction(_ sender: NSMenuItem) {
-            guard let sectionID = sender.representedObject as? String else { return }
-            presentedSecondarySections[sectionID]?.onAction?()
-        }
-
-        private func modelItem(
-            title: String,
-            repoID: String,
-            provider: LocalModelProvider?,
-            isSelected: Bool
-        ) -> NSMenuItem {
-            let item = persistentMenuItem(
-                title: NSAttributedString(
-                    string: title,
-                    attributes: [.font: Self.menuFont]
-                ),
-                optionID: repoID,
-                image: providerImage(provider),
-                isSelected: isSelected
-            ) { [weak self] in
-                self?.selectModel(repoID)
-            }
-            if let itemView = item.view as? PersistentMenuActionView {
-                modelOptionViews.append(itemView)
-            }
-            return item
-        }
-
-        private func persistentMenuItem(
-            title: NSAttributedString,
-            optionID: String,
-            image: NSImage?,
-            isSelected: Bool,
-            onSelect: @escaping () -> Void
-        ) -> NSMenuItem {
-            let item = NSMenuItem(title: title.string, action: nil, keyEquivalent: "")
-            item.isEnabled = true
-            item.view = PersistentMenuActionView(
-                optionID: optionID,
-                title: title,
-                image: image,
-                isSelected: isSelected,
-                onSelect: onSelect
-            )
-            return item
-        }
-
-        private func selectModel(_ repoID: String) {
-            let nextSecondarySections = parent.secondarySectionsForModel?(repoID)
-            modelOptionViews.forEach { $0.isSelected = $0.optionID == repoID }
-            modelSummaryItem?.title = "Model   \(modelMenuLabel(repoID))"
-
-            if let model = parent.models.first(where: { $0.repoID == repoID }) {
-                parent.onSelectModel(model)
-            } else {
-                parent.onSwitchModel(repoID)
-            }
-
-            if let nextSecondarySections, let presentedMenu {
-                installSecondarySections(nextSecondarySections, in: presentedMenu)
-                presentedMenu.update()
+            .frame(height: CGFloat(max(1, min(modelIDs.count, 7)) * 26))
+            if modelIDs.isEmpty, let title = emptyStateActionTitle, let action = onEmptyStateAction {
+                separator
+                NativPickerRow {
+                    onDismiss()
+                    action()
+                } content: {
+                    Image(systemName: "plus").foregroundStyle(.secondary).frame(width: 14)
+                    Text(title)
+                    Spacer(minLength: 4)
+                }
+                .disabled(!isEnabled)
             }
         }
+        .onAppear { searchIsFocused = true }
+        .onChange(of: search) { _, _ in highlightedModelID = matches.first }
+    }
 
-        private func selectSecondaryOption(_ optionID: String, sectionID: String) {
-            guard let section = presentedSecondarySections[sectionID],
-                  let option = section.options.first(where: { $0.id == optionID })
-            else { return }
-
-            secondaryOptionViews[sectionID]?.forEach {
-                $0.isSelected = $0.optionID == optionID
+    private func speedPage(_ section: ComposerModelPickerSecondarySection) -> some View {
+        VStack(spacing: 0) {
+            ForEach(section.options) { option in
+                Button {
+                    showsSpeedPicker = false
+                    section.onSelect(option.id)
+                } label: {
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(option.title).fontWeight(.medium)
+                            Text(option.detail).font(.system(size: 11)).foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                        if let method = option.speedMethod, !method.label.isEmpty {
+                            Text(method.label).font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary)
+                        }
+                        Image(systemName: "checkmark").fontWeight(.medium)
+                            .opacity(option.id == section.selectedID ? 1 : 0)
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(.rect)
+                }
+                .buttonStyle(ComposerSpeedOptionStyle(isSelected: option.id == section.selectedID))
+                .disabled(!isEnabled || !option.isEnabled)
+                .help(option.id.isEmpty ? option.detail : option.id)
+                .accessibilityValue(option.id == section.selectedID ? "Selected" : "")
             }
-            secondarySummaryItems[sectionID]?.title =
-                "\(section.title)   \(option.summaryTitle ?? option.title)"
-            section.onSelect(optionID)
+            if let status = section.statusTitle {
+                separator
+                Text(status).foregroundStyle(.secondary).padding(8)
+            } else if let title = section.actionTitle, let action = section.onAction {
+                separator
+                NativPickerRow {
+                    onDismiss()
+                    action()
+                } content: {
+                    Text(title)
+                    Spacer(minLength: 4)
+                }
+                .disabled(!isEnabled)
+            }
         }
+        .padding(4)
+    }
 
-        func updateActionAvailability(_ isEnabled: Bool) {
-            modelOptionViews.forEach { $0.isActionEnabled = isEnabled }
-            secondaryOptionViews.values.joined().forEach { $0.isActionEnabled = isEnabled }
+    private var separator: some View {
+        Divider().padding(.horizontal, 4).padding(.vertical, 4)
+    }
+
+    private func moveHighlight(_ offset: Int) {
+        let ids = matches
+        guard !ids.isEmpty else { return }
+        let current = highlightedModelID.flatMap { ids.firstIndex(of: $0) }
+            ?? (offset > 0 ? -1 : ids.count)
+        highlightedModelID = ids[max(0, min(ids.count - 1, current + offset))]
+    }
+}
+
+private struct ComposerModelMenuSurface: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 14))
+            .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(.primary.opacity(0.1), lineWidth: 0.5) }
+            .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+    }
+}
+
+private struct ComposerSpeedOptionStyle: ButtonStyle {
+    let isSelected: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        HoverRow(configuration: configuration, isSelected: isSelected)
+    }
+
+    private struct HoverRow: View {
+        let configuration: Configuration
+        let isSelected: Bool
+        @State private var isHovered = false
+
+        var body: some View {
+            configuration.label
+                .background(.primary.opacity(configuration.isPressed ? 0.14 : isHovered || isSelected ? 0.08 : 0),
+                            in: RoundedRectangle(cornerRadius: 9))
+                .onHover { isHovered = $0 }
         }
+    }
+}
 
-        private func modelMenuLabel(_ modelID: String) -> String {
-            NativFormatting.truncateModelName(
-                LocalModel.displayTitle(for: modelID),
-                maxLength: 28
-            )
+private struct ComposerLightningBolt: Shape {
+    func path(in rect: CGRect) -> Path {
+        let points: [CGPoint] = [
+            CGPoint(x: 15, y: 1), CGPoint(x: 3, y: 14),
+            CGPoint(x: 10, y: 14), CGPoint(x: 8, y: 23),
+            CGPoint(x: 22, y: 9), CGPoint(x: 14, y: 9),
+        ]
+        return Path { path in
+            path.addLines(points.map {
+                CGPoint(x: rect.minX + $0.x * rect.width / 24,
+                        y: rect.minY + $0.y * rect.height / 24)
+            })
+            path.closeSubpath()
         }
+    }
+}
 
-        private func providerImage(_ provider: LocalModelProvider?) -> NSImage? {
-            guard let provider,
-                  let source = LocalModelProviderIcon.image(for: provider),
-                  let image = source.copy() as? NSImage
-            else { return nil }
-            image.size = NSSize(width: 16, height: 16)
-            return image
+private struct ComposerReasoningSlider: View {
+    let options: [ComposerModelPickerSecondaryOption]
+    let selectedID: String
+    let onPreview: (String?) -> Void
+    let onSelect: (String) -> Void
+    @Environment(\.isEnabled) private var isEnabled
+    @State private var dragIndex: Int?
+    @FocusState private var isFocused: Bool
+
+    private var selectedIndex: Int { options.firstIndex { $0.id == selectedID } ?? 0 }
+    private var index: Int { min(dragIndex ?? selectedIndex, max(0, options.count - 1)) }
+
+    var body: some View {
+        GeometryReader { geometry in
+            let travel = max(1, geometry.size.width - 28)
+            let progress = CGFloat(index) / CGFloat(max(1, options.count - 1))
+            ZStack(alignment: .leading) {
+                Capsule().fill(.primary.opacity(0.12)).frame(height: 22)
+                Capsule().fill(Color.accentColor).frame(width: 28 + travel * progress, height: 22)
+                    .opacity(index == 0 ? 0 : 1)
+                HStack(spacing: 0) {
+                    ForEach(options.indices, id: \.self) { tick in
+                        if tick > 0 { Spacer(minLength: 0) }
+                        Circle().fill(tick <= index && index > 0 ? .white.opacity(0.4) : .primary.opacity(0.25))
+                            .frame(width: 3, height: 3)
+                    }
+                }
+                .padding(.horizontal, 14)
+                Circle().fill(.white).shadow(color: .black.opacity(0.18), radius: 2, y: 1)
+                    .frame(width: 28, height: 28).offset(x: travel * progress)
+            }
+            .frame(height: 30)
+            .contentShape(.rect)
+            .gesture(DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    guard isEnabled, !options.isEmpty else { return }
+                    isFocused = true
+                    let fraction = min(1, max(0, (value.location.x - 14) / travel))
+                    dragIndex = Int((fraction * CGFloat(options.count - 1)).rounded())
+                    onPreview(options[index].title)
+                }
+                .onEnded { _ in
+                    guard isEnabled, !options.isEmpty else { return }
+                    let option = options[index]
+                    dragIndex = nil
+                    onPreview(nil)
+                    if option.id != selectedID { onSelect(option.id) }
+                })
         }
-
-        private func secondaryOptionTitle(
-            _ option: ComposerModelPickerSecondaryOption,
-            options: [ComposerModelPickerSecondaryOption]
-        ) -> NSAttributedString {
-            let title = NSMutableAttributedString(
-                string: option.title,
-                attributes: [.font: Self.menuFont]
-            )
-            guard !option.detail.isEmpty else { return title }
-
-            let labelPadding = padding(
-                from: Self.textWidth(option.title),
-                to: options.map { Self.textWidth($0.title) }.max() ?? 0
-            ) + String(repeating: "\u{2007}", count: 3)
-            let detailPadding = padding(
-                from: Self.textWidth(option.detail),
-                to: options.map { Self.textWidth($0.detail) }.max() ?? 0
-            )
-            title.append(
-                NSAttributedString(
-                    string: labelPadding + detailPadding + option.detail,
-                    attributes: [
-                        .font: Self.menuFont,
-                        .foregroundColor: NSColor.tertiaryLabelColor
-                    ]
-                )
-            )
-            return title
+        .focusable(isEnabled)
+        .focusEffectDisabled()
+        .focused($isFocused)
+        .onKeyPress(.leftArrow) { adjust(-1); return .handled }
+        .onKeyPress(.rightArrow) { adjust(1); return .handled }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Reasoning")
+        .accessibilityValue(options.indices.contains(index) ? options[index].title : "Off")
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment: adjust(1)
+            case .decrement: adjust(-1)
+            @unknown default: break
+            }
         }
+    }
 
-        private static func textWidth(_ text: String) -> CGFloat {
-            (text as NSString).size(withAttributes: [.font: menuFont]).width
-        }
-
-        private func padding(from currentWidth: CGFloat, to targetWidth: CGFloat) -> String {
-            var remainingWidth = max(0, targetWidth - currentWidth)
-            let figureSpaceWidth = max(1, Self.textWidth("\u{2007}"))
-            let hairSpaceWidth = max(1, Self.textWidth("\u{200A}"))
-            let figureSpaces = Int(remainingWidth / figureSpaceWidth)
-            remainingWidth -= CGFloat(figureSpaces) * figureSpaceWidth
-            let hairSpaces = Int((remainingWidth / hairSpaceWidth).rounded())
-            return String(repeating: "\u{2007}", count: figureSpaces)
-                + String(repeating: "\u{200A}", count: hairSpaces)
-        }
+    private func adjust(_ delta: Int) {
+        guard isEnabled, !options.isEmpty else { return }
+        let next = min(options.count - 1, max(0, selectedIndex + delta))
+        if next != selectedIndex { onSelect(options[next].id) }
     }
 }
 
@@ -2285,9 +2222,10 @@ private struct ComposerModelPickerLabel: View {
     var body: some View {
         HStack(spacing: 5) {
             if showsFastIndicator {
-                Image(systemName: "bolt.fill")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(.black)
+                ComposerLightningBolt()
+                    .fill(.foreground)
+                    .frame(width: 12, height: 12)
+                    .foregroundStyle(.primary)
                     .accessibilityHidden(true)
             }
 

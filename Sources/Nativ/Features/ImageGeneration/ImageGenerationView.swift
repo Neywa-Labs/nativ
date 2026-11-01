@@ -352,7 +352,6 @@ private struct ImageGenerationComposer: View {
             selectedModelDetail: nil,
             showsFastIndicator: false,
             secondarySections: [],
-            secondarySectionsForModel: nil,
             isModelLoading: isSelectedModelLoading,
             modelLoadingPercentage: isSelectedModelLoading
                 ? model.modelLoadingPercentage

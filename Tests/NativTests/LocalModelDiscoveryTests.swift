@@ -820,11 +820,16 @@ final class LocalModelDiscoveryTests: XCTestCase {
             supportedDrafterKinds: [
                 "qwen3_5_mtp": "mtp",
                 "qwen3_dflash": "dflash",
+                "dflash2": "dflash",
                 "dspark": "dflash",
                 "eagle3": "eagle3",
             ]
         )
         let fixtures: [([String: Any], MLXDrafterMetadata)] = [
+            (["model_type": "qwen3", "architectures": ["DFlash2DraftModel"], "dflash_config": [:]],
+             MLXDrafterMetadata(loaderModelType: "dflash2", kind: "dflash")),
+            (["speculators_model_type": "dspark", "architectures": ["DSparkDraftModel"]],
+             MLXDrafterMetadata(loaderModelType: "dspark", kind: "dflash")),
             (
                 ["model_type": "qwen3_5_mtp"],
                 MLXDrafterMetadata(loaderModelType: "qwen3_5_mtp", kind: "mtp")
@@ -907,6 +912,104 @@ final class LocalModelDiscoveryTests: XCTestCase {
             let model = try XCTUnwrap(models.first { $0.repoID == repoID })
             XCTAssertTrue(model.capabilities.contains(.drafter), repoID)
             XCTAssertEqual(model.drafterKind, expectedKind, repoID)
+            XCTAssertNotNil(model.drafterModelType, repoID)
+            if repoID == "org/dspark" {
+                XCTAssertEqual(ComposerSpeedMethod(kind: model.drafterKind, modelType: model.drafterModelType), .dspark)
+            }
+        }
+    }
+
+    func testComposerSpeedTiersKeepActiveDrafterAndToggleLowestAvailableTier() {
+        var dspark = makeModel(repoID: "org/dspark", capabilities: [.drafter], drafterKind: "dflash")
+        dspark.drafterModelType = "gemma4_dspark"
+        var dflash2 = makeModel(repoID: "org/dflash2", capabilities: [.drafter], drafterKind: "dflash")
+        dflash2.drafterModelType = "dflash2"
+        let drafters = [
+            dspark, dflash2,
+            makeModel(repoID: "org/mtp-a", capabilities: [.drafter], drafterKind: "mtp"),
+            makeModel(repoID: "org/mtp-z", capabilities: [.drafter], drafterKind: "mtp"),
+        ]
+        let options = ComposerModelPickerSecondaryOption.speedOptions(
+            drafters: drafters, activeID: "org/mtp-z", activeKind: "mtp"
+        )
+        XCTAssertEqual(options.map(\.title), ["Off", "Fast", "Turbo", "Turbo+"])
+        XCTAssertEqual(options.map(\.id), ["", "org/mtp-z", "org/dspark", "org/dflash2"])
+
+        for (selectedID, available, expected) in [
+            ("", options, "org/mtp-z"),
+            ("org/dspark", options, ""),
+            ("", options.filter { $0.speedMethod != .mtp }, "org/dspark"),
+        ] {
+            let section = ComposerModelPickerSecondarySection(
+                id: "drafter", title: "Speed", selectedID: selectedID, selectedLabel: "",
+                options: available, onSelect: { _ in }
+            )
+            XCTAssertEqual(section.speedToggleOption?.id, expected)
+        }
+    }
+
+    func testQwenSpeedUsesBuiltInMTPAndPreferredDrafters() {
+        var target = makeModel(repoID: "nvidia/Qwen3.8-27B-NVFP4", capabilities: [.text])
+        target.hasBuiltInMTP = true
+        let ids = ["RedHatAI/Qwen3.8-27B-speculator.dspark", "incoai/Qwen3.8-27B-DFlash2"]
+        let drafters = zip(ids, ["dspark", "dflash2"]).map { id, type in
+            var model = makeModel(repoID: id, capabilities: [.drafter], drafterKind: "dflash")
+            model.drafterModelType = type
+            return model
+        }
+        for installed in [[], drafters] {
+            let options = ComposerModelPickerSecondaryOption.speedOptions(
+                drafters: installed, activeID: target.repoID, activeKind: "mtp", target: target
+            )
+            XCTAssertEqual(options.map(\.title), ["Off", "Fast", "Turbo", "Turbo+"])
+            XCTAssertEqual(options.map(\.id), ["", target.repoID] + ids)
+            XCTAssertEqual(options.map(\.isEnabled), [true, true, !installed.isEmpty, !installed.isEmpty])
+        }
+        for drafter in drafters { XCTAssertTrue(DrafterModelCompatibility.isCompatible(drafter, with: target)) }
+    }
+
+    func testBuiltInMTPDiscoveryRequiresTensorsAndKeepsTargetInModelPicker() async throws {
+        for storage in ["index", "header", "missing"] {
+            let repoID = "org/Qwen3.8-27B-\(storage)"
+            let snapshot = snapshotURL(repoID: repoID)
+            try write(snapshot.lastPathComponent,
+                      to: snapshot.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("refs/main"))
+            try write("weights", to: snapshot.appendingPathComponent("model.safetensors"))
+            try writeJSON(["model_type": "qwen3_5", "text_config": ["mtp_num_hidden_layers": 1]],
+                          to: snapshot.appendingPathComponent("config.json"))
+            if storage == "index" {
+                try writeJSON(["weight_map": ["mtp.layers.0.weight": "model.safetensors"]],
+                              to: snapshot.appendingPathComponent("model.safetensors.index.json"))
+            } else if storage == "header" {
+                let header = try JSONSerialization.data(withJSONObject: ["mtp.layers.0.weight": [:]])
+                var length = UInt64(header.count).littleEndian
+                let data = withUnsafeBytes(of: &length) { Data($0) } + header
+                try data.write(to: snapshot.appendingPathComponent("model.safetensors"))
+            }
+        }
+        let models = try await LocalModelDiscovery.scan(searchPaths: searchPaths)
+        XCTAssertEqual(models.count, 3)
+        for model in models {
+            XCTAssertEqual(model.hasBuiltInMTP, !model.repoID.hasSuffix("missing"), model.repoID)
+            XCTAssertTrue(model.isEligibleForLanguageModelPicker)
+            XCTAssertNil(model.drafterKind)
+        }
+    }
+
+    func testComposerSpeedHandlesMissingDraftersAndOtherMethods() {
+        XCTAssertEqual(ComposerSpeedMethod(kind: "eagle3").tier, "Fast")
+        XCTAssertEqual(ComposerSpeedMethod(kind: "future-method"), .other)
+        let offOnly = ComposerModelPickerSecondaryOption.speedOptions(drafters: [], activeID: "", activeKind: "auto")
+        XCTAssertEqual(offOnly.map(\.id), [""])
+        let missing = ComposerModelPickerSecondaryOption.speedOptions(drafters: [], activeID: "missing", activeKind: "dflash")
+        XCTAssertEqual(missing.last?.title, "Turbo")
+        XCTAssertEqual(missing.last?.isEnabled, false)
+        for (selectedID, options, expected) in [("", offOnly, nil as String?), ("missing", missing, "")] {
+            let section = ComposerModelPickerSecondarySection(
+                id: "drafter", title: "Speed", selectedID: selectedID, selectedLabel: "",
+                options: options, onSelect: { _ in }
+            )
+            XCTAssertEqual(section.speedToggleOption?.id, expected)
         }
     }
 
