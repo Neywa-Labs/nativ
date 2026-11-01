@@ -1909,18 +1909,6 @@ enum HuggingFaceXetDownload {
     file_download.xet_get = native_xet_get
     """
 
-    /// swift-xet waits 120 s on a silent xorb fetch before retrying it, longer than
-    /// the download watchdog allows, so a single slow range near the end of a shard
-    /// used to restart every file from zero. Time out sooner and retry sooner instead.
-    static let configuration: XetDownloader.Configuration = {
-        var configuration = XetDownloader.Configuration()
-        configuration.readTimeout = 30
-        configuration.retryBaseDelay = 1
-        return configuration
-    }()
-
-    nonisolated(unsafe) private static var terminationSource: DispatchSourceSignal?
-
     static func run() async -> Never {
         do {
             let arguments = Array(CommandLine.arguments.dropFirst(2))
@@ -1929,15 +1917,12 @@ enum HuggingFaceXetDownload {
                   let expectedSize = Int64(arguments[3]), expectedSize >= 0 else {
                 throw CocoaError(.fileReadInvalidFileName)
             }
-            let destination = URL(fileURLWithPath: arguments[2])
-            removeDestinationOnTermination(destination)
             let written = try await Xet.withDownloader(
                 refreshURL: refreshURL,
-                hubToken: ProcessInfo.processInfo.environment["HF_TOKEN"],
-                configuration: configuration
+                hubToken: ProcessInfo.processInfo.environment["HF_TOKEN"]
             ) { downloader in
                 try await downloader.download(
-                    arguments[0], to: destination
+                    arguments[0], to: URL(fileURLWithPath: arguments[2])
                 ) { completed, _ in
                     print(completed)
                     fflush(stdout)
@@ -1951,20 +1936,6 @@ enum HuggingFaceXetDownload {
             FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
             exit(1)
         }
-    }
-
-    /// huggingface_hub names each attempt's partial file uniquely and only removes it
-    /// when Python unwinds, which a stalled or cancelled download's SIGTERM skips.
-    /// Without this, every retry leaves a multi-gigabyte orphan in the cache.
-    private static func removeDestinationOnTermination(_ destination: URL) {
-        signal(SIGTERM, SIG_IGN)
-        let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global())
-        source.setEventHandler {
-            try? FileManager.default.removeItem(at: destination)
-            exit(128 + SIGTERM)
-        }
-        source.resume()
-        terminationSource = source
     }
 }
 

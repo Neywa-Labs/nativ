@@ -267,8 +267,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/huggingface/swift-xet.git",
       "state" : {
-        "revision" : "4f6893472c071054d3ecc5a88e397e923613b0c4",
-        "version" : "1.1.0"
+        "revision" : "4b9b9af2acd55e719bda147d8c4f99ce84006e4f",
+        "version" : "1.1.1"
       }
     },
     {
