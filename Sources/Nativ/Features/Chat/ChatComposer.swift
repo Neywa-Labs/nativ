@@ -1708,7 +1708,7 @@ struct ComposerModelPicker: View {
         .frame(height: 32)
         .background {
             NativArrowlessPopoverPresenter(
-                isPresented: $isMenuOpen, gap: 14, alignment: .trailing,
+                isPresented: $isMenuOpen, gap: 14, alignment: .center,
                 cornerRadius: 14, title: "Choose model", drawsSurface: false
             ) {
                 ComposerModelPickerMenu(
@@ -1814,10 +1814,11 @@ private struct ComposerModelPickerMenu: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .center, spacing: 8) {
             if showsModelPicker {
                 modelPage
                     .padding(4)
+                    .frame(width: 360)
                     .modifier(ComposerModelMenuSurface())
             } else if showsSpeedPicker, let speedSection {
                 speedPage(speedSection)
@@ -1825,10 +1826,11 @@ private struct ComposerModelPickerMenu: View {
                     .modifier(ComposerModelMenuSurface())
             }
             mainPage
+                .frame(minWidth: 240, maxWidth: 360)
+                .fixedSize(horizontal: true, vertical: false)
                 .modifier(ComposerModelMenuSurface())
         }
         .font(.system(size: 12))
-        .frame(width: 360)
         .background {
             Color.clear.contentShape(.rect).onTapGesture { dismissSubmenu() }
         }
@@ -1856,29 +1858,32 @@ private struct ComposerModelPickerMenu: View {
         VStack(spacing: 12) {
             HStack(spacing: 8) {
                 if let speedSection { speedButton(speedSection) }
-                NativPickerRow(isHighlighted: showsModelPicker) {
+                Button {
                     showsSpeedPicker = false
                     showsModelPicker.toggle()
                     searchIsFocused = showsModelPicker
-                } content: {
-                    Text(selectedModelLabel).fontWeight(.medium)
-                        .lineLimit(1).truncationMode(.middle)
-                    if let reasoningSection {
-                        Text(previewReasoningID ?? reasoningSection.selectedLabel)
+                } label: {
+                    HStack(spacing: 8) {
+                        Text(selectedModelLabel).fontWeight(.medium)
+                            .lineLimit(1).truncationMode(.middle)
+                        if let reasoningSection {
+                            ZStack(alignment: .leading) {
+                                // Keep the slider width stable while previewing effort levels.
+                                ForEach(reasoningSection.options) { Text($0.title).hidden() }
+                                Text(previewReasoningID ?? reasoningSection.selectedLabel)
+                            }
                             .foregroundStyle(.secondary).fixedSize()
+                        }
+                        Image(systemName: showsModelPicker ? "chevron.up" : "chevron.right")
+                            .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
                     }
-                    Image(systemName: showsModelPicker ? "chevron.up" : "chevron.right")
-                        .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .frame(height: 30)
+                    .contentShape(.rect)
                 }
+                .buttonStyle(ComposerSpeedOptionStyle(isSelected: showsModelPicker))
                 .help("Choose model")
                 .accessibilityLabel("Choose model")
-                if let speedSection, !speedSection.selectedID.isEmpty {
-                    Text(speedSection.selectedLabel.uppercased())
-                        .font(.system(size: 9, weight: .medium, design: .monospaced))
-                        .padding(.horizontal, 5).padding(.vertical, 3)
-                        .background(.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 4))
-                        .accessibilityLabel("Speed: \(speedSection.selectedLabel)")
-                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             if let reasoningSection, reasoningSection.options.count > 1 {
@@ -1899,61 +1904,53 @@ private struct ComposerModelPickerMenu: View {
         let active = !section.selectedID.isEmpty
         let method = section.selectedOption?.speedMethod
         let hasChoices = section.options.filter { !$0.id.isEmpty }.count > 1
-        return HStack(spacing: 0) {
-            Button {
+        return Button {
+            if hasChoices {
+                showsModelPicker = false
+                searchIsFocused = false
+                showsSpeedPicker.toggle()
+            } else {
                 dismissSubmenu()
                 if let option = section.speedToggleOption { section.onSelect(option.id) }
                 else if let action = section.onAction, section.actionTitle != nil { onDismiss(); action() }
-            } label: {
-                ZStack(alignment: .bottomTrailing) {
-                    ComposerLightningBolt()
-                        .fill(.foreground)
-                        .frame(width: 17, height: 17)
-                    if method?.rank == 2 {
-                        Text("+").font(.system(size: 8, weight: .bold)).offset(x: 5, y: 3)
+            }
+        } label: {
+            ZStack(alignment: .bottomTrailing) {
+                Group {
+                    if active {
+                        ComposerLightningBolt().fill(.foreground)
+                    } else {
+                        ComposerLightningBolt()
+                            .stroke(.foreground, style: StrokeStyle(lineWidth: 1.2, lineJoin: .round))
                     }
                 }
-                .foregroundStyle(active ? .primary : .secondary)
-                .frame(width: 32, height: 30)
-                .contentShape(.rect)
-            }
-            .buttonStyle(.plain)
-            .disabled(!isEnabled || (section.speedToggleOption == nil && section.actionTitle == nil))
-            .accessibilityLabel(active ? "Turn speed off" : section.speedToggleOption != nil ? "Turn speed on" : "Find draft models")
-            .accessibilityValue(section.selectedLabel)
-            .onHover { isSpeedHovered = $0 }
-            .background {
-                NativArrowlessPopoverPresenter(
-                    isPresented: Binding(get: { isSpeedHovered && !showsSpeedPicker },
-                                         set: { isSpeedHovered = $0 }),
-                    gap: 8, alignment: .leading, cornerRadius: 8, isInteractive: false
-                ) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(active ? "\(section.selectedLabel) on" : "Speed off").fontWeight(.medium)
-                        Text(section.selectedOption?.detail ?? "Standard decoding").foregroundStyle(.secondary)
-                    }
-                    .font(.system(size: 11)).padding(8)
+                .frame(width: 17, height: 17)
+                if method?.rank == 2 {
+                    Text("+").font(.system(size: 8, weight: .bold)).offset(x: 5, y: 3)
                 }
             }
-            if hasChoices {
-                Divider().frame(height: 20)
-                Button {
-                    showsModelPicker = false
-                    searchIsFocused = false
-                    showsSpeedPicker.toggle()
-                } label: {
-                    Image(systemName: showsSpeedPicker ? "chevron.down" : "chevron.up")
-                        .font(.system(size: 8, weight: .semibold))
-                        .frame(width: 18, height: 30).contentShape(.rect)
+            .foregroundStyle(active ? .primary : .secondary)
+            .frame(width: 32, height: 30)
+            .contentShape(.rect)
+        }
+        .buttonStyle(ComposerSpeedOptionStyle(isSelected: showsSpeedPicker))
+        .disabled(!isEnabled || (!hasChoices && section.speedToggleOption == nil && section.actionTitle == nil))
+        .accessibilityLabel(hasChoices ? "Choose speed tier" : active ? "Turn speed off" : section.speedToggleOption != nil ? "Turn speed on" : "Find draft models")
+        .accessibilityValue(section.selectedLabel)
+        .onHover { isSpeedHovered = $0 }
+        .background {
+            NativArrowlessPopoverPresenter(
+                isPresented: Binding(get: { isSpeedHovered && !showsSpeedPicker },
+                                     set: { isSpeedHovered = $0 }),
+                gap: 8, alignment: .leading, cornerRadius: 8, isInteractive: false
+            ) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(active ? "\(section.selectedLabel) on" : "Speed off").fontWeight(.medium)
+                    Text(section.selectedOption?.detail ?? "Standard decoding").foregroundStyle(.secondary)
                 }
-                .buttonStyle(.plain)
-                .disabled(!isEnabled)
-                .accessibilityLabel("Choose speed tier")
+                .font(.system(size: 11)).padding(8)
             }
         }
-        .background(.primary.opacity(active || showsSpeedPicker ? 0.08 : 0.04),
-                    in: RoundedRectangle(cornerRadius: 7))
-        .overlay { RoundedRectangle(cornerRadius: 7).strokeBorder(.primary.opacity(0.12), lineWidth: 0.5) }
     }
 
     private var modelPage: some View {
@@ -2262,11 +2259,12 @@ private struct ComposerModelPickerLabel: View {
     }
 
     private var pickerTitle: Text {
-        let modelName = Text(selectedModelLabel)
+        let modelName = Text(selectedModelLabel).foregroundColor(.primary)
         guard let selectedModelDetail else {
             return modelName
         }
-        return Text("\(modelName)  \(selectedModelDetail)").foregroundColor(.secondary)
+        let detail = Text(selectedModelDetail).foregroundColor(.secondary)
+        return Text("\(modelName)  \(detail)")
     }
 
 }
