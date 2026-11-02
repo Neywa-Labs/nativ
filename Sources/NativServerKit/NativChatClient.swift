@@ -788,10 +788,13 @@ public final class NativChatClient: @unchecked Sendable {
         var streamedGeneratedTokens = 0
         var firstGeneratedTokenAt: Date?
         var lastGeneratedTokenAt: Date?
+        // Resumed streams can replay buffered chunks. Their arrival rate and count
+        // do not describe decoding or include the already delivered response.
+        let allowsLocalMetrics = request.continuation == nil && !request.continueFinalMessage
         var toolCallAccumulator = MLXChatToolCallAccumulator()
 
         func cumulativeDecodeTokensPerSecond() -> Double? {
-            guard streamedGeneratedTokens > 1,
+            guard allowsLocalMetrics, streamedGeneratedTokens > 1,
                   let firstGeneratedTokenAt,
                   let lastGeneratedTokenAt
             else {
@@ -857,7 +860,7 @@ public final class NativChatClient: @unchecked Sendable {
                 if let toolCallDeltas, !toolCallDeltas.isEmpty {
                     toolCallAccumulator.merge(toolCallDeltas)
                 }
-                let liveDecodeTokensPerSecond = cumulativeDecodeTokensPerSecond()
+                let liveDecodeTokensPerSecond = decodeTokensPerSecond ?? cumulativeDecodeTokensPerSecond()
                 if contentDelta?.isEmpty == false
                     || reasoningDelta?.isEmpty == false
                     || toolCallDeltas?.isEmpty == false
@@ -869,7 +872,7 @@ public final class NativChatClient: @unchecked Sendable {
                             toolCalls: toolCallDeltas,
                             decodeTokensPerSecond: liveDecodeTokensPerSecond,
                             generatedTokens: chunk.usage?.completionTokens
-                                ?? streamedGeneratedTokens,
+                                ?? (allowsLocalMetrics ? streamedGeneratedTokens : nil),
                             continuation: chunk.continuation
                         )
                     )
@@ -879,7 +882,7 @@ public final class NativChatClient: @unchecked Sendable {
                     MLXChatStreamDelta(
                         decodeTokensPerSecond: decodeTokensPerSecond,
                         generatedTokens: chunk.usage?.completionTokens
-                            ?? streamedGeneratedTokens,
+                            ?? (allowsLocalMetrics ? streamedGeneratedTokens : nil),
                         continuation: chunk.continuation
                     )
                 )

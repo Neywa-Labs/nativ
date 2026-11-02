@@ -1470,16 +1470,90 @@ final class ChatTimeoutTests: XCTestCase {
 }
 
 @MainActor
+final class ChatStreamMetricsTests: XCTestCase {
+    func testServerDecodeRateTakesPrecedenceOverChunkArrivalRate() async throws {
+        let events = try await stream(resuming: false, serverMetrics: true)
+        XCTAssertEqual(events[1].decodeTokensPerSecond, 55)
+        XCTAssertEqual(events[2].decodeTokensPerSecond, 55)
+        XCTAssertEqual(events.last?.generatedTokens, 80)
+        XCTAssertEqual(events.last?.decodeTokensPerSecond, 50)
+    }
+
+    func testResumingDoesNotResetCountsOrMeasureBufferedReplayAsDecoding() async throws {
+        for serverMetrics in [false, true] {
+            let events = try await stream(resuming: true, serverMetrics: serverMetrics)
+            XCTAssertTrue(events.dropLast().allSatisfy { $0.generatedTokens == nil })
+            XCTAssertNil(events[0].decodeTokensPerSecond)
+            for event in events[1...2] {
+                XCTAssertEqual(event.decodeTokensPerSecond, serverMetrics ? 55 : nil)
+            }
+            XCTAssertEqual(events.last?.generatedTokens, 80)
+            XCTAssertEqual(events.last?.decodeTokensPerSecond, 50)
+        }
+    }
+
+    func testFreshStreamsRetainFallbackMetricsForServersWithoutLiveTimings() async throws {
+        let events = try await stream(resuming: false, serverMetrics: false)
+        XCTAssertEqual(events[1].generatedTokens, 1)
+        XCTAssertEqual(events[2].generatedTokens, 2)
+        XCTAssertGreaterThan(try XCTUnwrap(events[2].decodeTokensPerSecond), 0)
+    }
+
+    private func stream(resuming: Bool, serverMetrics: Bool) async throws -> [MLXChatStreamDelta] {
+        let checkpoint = #"{"id":"saved","cursor":20,"content":60,"reasoning":0,"responses":false}"#
+        let metrics = serverMetrics ? #", "timings":{"predicted_per_second":55}"# : ""
+        let body = """
+        data: {"choices":[],"continuation":\(checkpoint)}
+
+        data: {"choices":[{"delta":{"content":" more"}}]\(metrics)}
+
+        data: {"choices":[{"delta":{"content":" text"}}]\(metrics)}
+
+        data: {"choices":[],"usage":{"completion_tokens":80},"timings":{"predicted_per_second":50}}
+
+        data: [DONE]
+
+
+        """
+        let server = try ChatTimeoutHTTPFixture(delays: [0], streamBody: body)
+        let url = try await server.start()
+        defer { server.stop() }
+        var request = MLXChatCompletionRequest(
+            model: "test", messages: [.init(role: "user", content: "Hello")],
+            maxTokens: 100, temperature: 0, topK: 0, topP: 1, minP: 0
+        )
+        request.resumable = true
+        if resuming {
+            request.continuation = try JSONDecoder().decode(
+                MLXGenerationContinuation.self, from: Data(checkpoint.utf8)
+            )
+        }
+        let recorder = StreamEventRecorder()
+        _ = try await NativChatClient(baseURL: url).streamChat(request, onEvent: { event in
+            await recorder.append(event)
+        })
+        let events = await recorder.events
+        XCTAssertEqual(events.count, 4)
+        return events
+    }
+}
+
+private actor StreamEventRecorder {
+    private(set) var events: [MLXChatStreamDelta] = []
+    func append(_ event: MLXChatStreamDelta) { events.append(event) }
+}
+
+@MainActor
 private final class ChatTimeoutHTTPFixture {
     private let listener: NWListener
 
-    init(delays: [TimeInterval]) throws {
+    init(delays: [TimeInterval], streamBody: String? = nil) throws {
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
         listener = try NWListener(using: parameters)
         listener.newConnectionHandler = { connection in
             connection.start(queue: .global())
-            Self.receive(connection, buffered: Data(), delays: delays)
+            Self.receive(connection, buffered: Data(), delays: delays, streamBody: streamBody)
         }
     }
 
@@ -1497,12 +1571,12 @@ private final class ChatTimeoutHTTPFixture {
 
     func stop() { listener.cancel() }
 
-    nonisolated private static func receive(_ connection: NWConnection, buffered: Data, delays: [TimeInterval]) {
+    nonisolated private static func receive(_ connection: NWConnection, buffered: Data, delays: [TimeInterval], streamBody: String?) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, complete, error in
             let request = buffered + (data ?? Data())
             guard let headerRange = request.range(of: Data("\r\n\r\n".utf8)) else {
                 if complete || error != nil { connection.cancel() }
-                else { receive(connection, buffered: request, delays: delays) }
+                else { receive(connection, buffered: request, delays: delays, streamBody: streamBody) }
                 return
             }
             let headers = String(decoding: request[..<headerRange.lowerBound], as: UTF8.self)
@@ -1511,14 +1585,14 @@ private final class ChatTimeoutHTTPFixture {
                 .flatMap { Int($0.split(separator: ":", maxSplits: 1)[1].trimmingCharacters(in: .whitespaces)) } ?? 0
             guard request.count >= headerRange.upperBound + length else {
                 if complete || error != nil { connection.cancel() }
-                else { receive(connection, buffered: request, delays: delays) }
+                else { receive(connection, buffered: request, delays: delays, streamBody: streamBody) }
                 return
             }
             let responses = headers.hasPrefix("POST /v1/responses ")
-            let body = responses
+            let body = streamBody ?? (responses
                 ? "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Done\"}]}]}}\n\n"
-                : "data: {\"choices\":[{\"delta\":{\"content\":\"Done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
-            connection.send(content: Data("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n".utf8), completion: .contentProcessed { _ in })
+                : "data: {\"choices\":[{\"delta\":{\"content\":\"Done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+            connection.send(content: Data("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-MLX-Continuation: 1\r\nConnection: close\r\n\r\n".utf8), completion: .contentProcessed { _ in })
             for (index, delay) in delays.enumerated() {
                 let last = index == delays.count - 1
                 DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
