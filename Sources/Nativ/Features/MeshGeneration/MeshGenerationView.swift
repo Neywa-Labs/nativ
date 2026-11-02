@@ -6,12 +6,10 @@ import UniformTypeIdentifiers
 struct MeshGenerationView: View {
     let model: NativModel
     @ObservedObject var viewModel: MeshGenerationViewModel
-    let onSelectWorkspaceMode: (ChatWorkspaceMode) -> Void
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                ChatWorkspacePicker(selection: .threeD, onSelect: onSelectWorkspaceMode)
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Image to 3D").font(.title2.weight(.semibold))
                     Text("Turn one object image into a 3D Gaussian splat with Idol.")
@@ -118,10 +116,12 @@ struct MeshGenerationView: View {
         VStack(alignment: .leading, spacing: 16) {
             Label("3D result", systemImage: "cube.transparent").font(.headline)
             if let result = viewModel.selectedResult {
-                if let image = NSImage(contentsOf: viewModel.inputURL(for: result)) {
-                    Image(nsImage: image).resizable().scaledToFit().frame(height: 180)
-                    Text("Source image").font(.caption).foregroundStyle(.secondary)
-                }
+                GaussianSplatPreview(
+                    url: viewModel.outputURL(for: result),
+                    cameraURL: viewModel.cameraURL(for: result)
+                )
+                .frame(height: 340)
+                .id(result.id)
                 Text(result.name).font(.headline)
                 Text("Gaussian splat · PLY · " + ByteCountFormatter.string(fromByteCount: result.bytes, countStyle: .file))
                     .font(.callout).foregroundStyle(.secondary)
@@ -129,10 +129,8 @@ struct MeshGenerationView: View {
                     Button("Save PLY…") { viewModel.save(result) }
                     Button("Show in Finder") { viewModel.reveal(result) }
                 }
-                Text("Open the PLY in a Gaussian splat viewer to explore the object in 3D.")
-                    .font(.caption).foregroundStyle(.secondary)
             } else {
-                Text("Your generated object will be saved here for export.")
+                Text("Your generated object will appear here. Rotate, zoom, or export it as PLY.")
                     .foregroundStyle(.secondary)
                 Text("50 steps · 262,144 splats").font(.caption).foregroundStyle(.secondary)
             }

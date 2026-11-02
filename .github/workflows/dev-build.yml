@@ -90,6 +90,7 @@ jobs:
             -only-testing:NativTests/HuggingFaceModelSupportTests \
             -only-testing:NativTests/MLXImageModelResolverTests \
             -only-testing:NativTests/MeshGenerationTests \
+            -only-testing:NativTests/GaussianSplatTests \
             -only-testing:NativTests/NativModelTypeRegistryDrafterTests \
             -only-testing:NativTests/ChatResponseSpeechTests \
             -only-testing:NativTests/NativAudioSpeechClientTests \

@@ -1,6 +1,6 @@
 # Image to 3D
 
-Select **3D** in the Chat / Images / 3D workspace picker. Choose an image of one
+Open **Images**, then select **Image to 3D**. Choose an image of one
 object, select **Photo** or **Illustration or render**, then click **Generate 3D**.
 Idol runs locally on Apple silicon. A seed makes repeated generations reproducible.
 
@@ -21,7 +21,11 @@ workspaces, and all Nativ windows share the same 3D history. Keep Nativ and its
 server running until generation completes; unfinished jobs cannot resume after
 a restart.
 
-The result thumbnail is labeled **Source image**. To inspect the reconstruction,
-open the PLY in a Gaussian-splat viewer. PLY contains splats rather than a triangle
-mesh; standard mesh viewers may not display it correctly. In-app 3D rendering,
-GLB/OBJ conversion, video rendering, and multi-image conditioning are not included.
+Completed results open automatically in an interactive Metal Gaussian splat preview.
+Drag to rotate, scroll or pinch to zoom, and use **Reset view** to restore the initial
+camera. Selecting an object in **Recent objects** opens its saved reconstruction.
+Rendering and camera controls run locally without a viewer dependency.
+
+PLY contains splats rather than a triangle mesh; standard mesh viewers may not
+display it correctly. GLB/OBJ conversion, video export, and multi-image conditioning
+are not included.

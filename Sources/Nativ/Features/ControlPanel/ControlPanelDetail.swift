@@ -47,6 +47,7 @@ extension ControlPanelView {
         case .chat:
             ChatWorkspaceView(
                 mode: chatWorkspaceMode,
+                imagesMode: $imagesWorkspaceMode,
                 onSelectMode: selectChatWorkspaceMode,
                 model: model,
                 chat: chat,
@@ -231,6 +232,7 @@ extension ControlPanelView {
             chatWorkspaceMode = .chat
             selectedTab = .chat
         case .imageGeneration(let sessionID):
+            imagesWorkspaceMode = .images
             if sidebarState.recents.containsImageSession(sessionID) {
                 imageGeneration.selectSession(sessionID)
                 sidebarSelection = selection
@@ -246,6 +248,7 @@ extension ControlPanelView {
 
 struct ChatWorkspaceView: View {
     let mode: ChatWorkspaceMode
+    @Binding var imagesMode: ImagesWorkspaceMode
     let onSelectMode: (ChatWorkspaceMode) -> Void
     let model: NativModel
     let chat: ChatViewModel
@@ -275,17 +278,11 @@ struct ChatWorkspaceView: View {
                     onFindDraftModels: onFindDraftModels
                 )
             case .images:
-                ImageGenerationView(
-                    model: model,
-                    viewModel: imageGeneration,
-                    workspaceMode: mode,
+                ImagesWorkspaceView(
+                    model: model, imageGeneration: imageGeneration,
+                    meshGeneration: meshGeneration, mode: $imagesMode,
                     onSelectWorkspaceMode: onSelectMode,
                     onExploreImageModels: { onExploreImageModels(.generate) }
-                )
-            case .threeD:
-                MeshGenerationView(
-                    model: model, viewModel: meshGeneration,
-                    onSelectWorkspaceMode: onSelectMode
                 )
             }
         }

@@ -398,10 +398,6 @@ extension ControlPanelView {
         case .images:
             imageGeneration.beginNewDraft(preservingUncommittedDraft: true)
             showImageWorkspace()
-        case .threeD:
-            chatWorkspaceMode = .threeD
-            selectedTab = .chat
-            sidebarSelection = .tab(.chat)
         }
     }
 

@@ -12,8 +12,6 @@ struct ImageGenerationView: View {
 
     var model: NativModel
     @ObservedObject var viewModel: ImageGenerationViewModel
-    let workspaceMode: ChatWorkspaceMode
-    let onSelectWorkspaceMode: (ChatWorkspaceMode) -> Void
     let onExploreImageModels: () -> Void
     @StateObject private var localLibrary = LocalModelLibrary()
     @State private var transcriptScrollPosition = ScrollPosition(edge: .bottom)
@@ -29,8 +27,6 @@ struct ImageGenerationView: View {
                     localModels: localLibrary.models,
                     isScanningForModels: localLibrary.isScanning,
                     modelScanError: localLibrary.error,
-                    workspaceMode: workspaceMode,
-                    onSelectWorkspaceMode: onSelectWorkspaceMode,
                     onExploreImageModels: onExploreImageModels
                 )
                     .frame(maxWidth: Layout.composerMaxWidth)
@@ -157,8 +153,6 @@ private struct ImageGenerationComposer: View {
     let localModels: [LocalModel]
     let isScanningForModels: Bool
     let modelScanError: String?
-    let workspaceMode: ChatWorkspaceMode
-    let onSelectWorkspaceMode: (ChatWorkspaceMode) -> Void
     let onExploreImageModels: () -> Void
     @State private var editorContentHeight: CGFloat = 0
     @State private var showsSettings = false
@@ -219,11 +213,6 @@ private struct ImageGenerationComposer: View {
                     )
                     .frame(width: 30, height: 30)
                     .help("Add a reference image")
-
-                    ChatWorkspacePicker(
-                        selection: workspaceMode,
-                        onSelect: onSelectWorkspaceMode
-                    )
 
                     Button {
                         showsSettings.toggle()

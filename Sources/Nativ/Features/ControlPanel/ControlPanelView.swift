@@ -27,6 +27,7 @@ struct ControlPanelView: View {
     @State var isFullScreen = false
     @State var selectedExtensionsHubSection: ExtensionsHubView.HubSection = .kits
     @State var chatWorkspaceMode: ChatWorkspaceMode = .chat
+    @State var imagesWorkspaceMode: ImagesWorkspaceMode = .images
     @State var speechModelDiscoveryRequest: Int
     @State var imageModelDiscoveryRequest: Int
     @State var imageModelDiscoveryCapability: LocalModelCapability

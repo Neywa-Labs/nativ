@@ -154,6 +154,10 @@ final class MeshGenerationViewModel: ObservableObject {
         directory.appendingPathComponent(record.id.uuidString).appendingPathComponent("input.png")
     }
 
+    func cameraURL(for record: MeshGenerationRecord) -> URL {
+        outputURL(for: record).deletingLastPathComponent().appendingPathComponent("camera.json")
+    }
+
     func save(_ record: MeshGenerationRecord) {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [UTType(filenameExtension: "ply") ?? .data]
