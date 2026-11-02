@@ -1544,16 +1544,18 @@ private actor StreamEventRecorder {
 }
 
 @MainActor
-private final class ChatTimeoutHTTPFixture {
+final class ChatTimeoutHTTPFixture {
     private let listener: NWListener
 
-    init(delays: [TimeInterval], streamBody: String? = nil) throws {
+    typealias Responder = @Sendable (String, Data) -> (status: Int, body: String)
+
+    init(delays: [TimeInterval], streamBody: String? = nil, responder: Responder? = nil) throws {
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
         listener = try NWListener(using: parameters)
         listener.newConnectionHandler = { connection in
             connection.start(queue: .global())
-            Self.receive(connection, buffered: Data(), delays: delays, streamBody: streamBody)
+            Self.receive(connection, buffered: Data(), delays: delays, streamBody: streamBody, responder: responder)
         }
     }
 
@@ -1571,12 +1573,13 @@ private final class ChatTimeoutHTTPFixture {
 
     func stop() { listener.cancel() }
 
-    nonisolated private static func receive(_ connection: NWConnection, buffered: Data, delays: [TimeInterval], streamBody: String?) {
+    nonisolated private static func receive(_ connection: NWConnection, buffered: Data, delays: [TimeInterval],
+                                            streamBody: String?, responder: Responder?) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, complete, error in
             let request = buffered + (data ?? Data())
             guard let headerRange = request.range(of: Data("\r\n\r\n".utf8)) else {
                 if complete || error != nil { connection.cancel() }
-                else { receive(connection, buffered: request, delays: delays, streamBody: streamBody) }
+                else { receive(connection, buffered: request, delays: delays, streamBody: streamBody, responder: responder) }
                 return
             }
             let headers = String(decoding: request[..<headerRange.lowerBound], as: UTF8.self)
@@ -1585,14 +1588,17 @@ private final class ChatTimeoutHTTPFixture {
                 .flatMap { Int($0.split(separator: ":", maxSplits: 1)[1].trimmingCharacters(in: .whitespaces)) } ?? 0
             guard request.count >= headerRange.upperBound + length else {
                 if complete || error != nil { connection.cancel() }
-                else { receive(connection, buffered: request, delays: delays, streamBody: streamBody) }
+                else { receive(connection, buffered: request, delays: delays, streamBody: streamBody, responder: responder) }
                 return
             }
             let responses = headers.hasPrefix("POST /v1/responses ")
-            let body = streamBody ?? (responses
+            let reply = responder?(headers, request.subdata(in: headerRange.upperBound..<(headerRange.upperBound + length)))
+            let body = reply?.body ?? streamBody ?? (responses
                 ? "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Done\"}]}]}}\n\n"
                 : "data: {\"choices\":[{\"delta\":{\"content\":\"Done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
-            connection.send(content: Data("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-MLX-Continuation: 1\r\nConnection: close\r\n\r\n".utf8), completion: .contentProcessed { _ in })
+            let status = reply?.status ?? 200
+            let contentType = status == 200 ? "text/event-stream" : "application/json"
+            connection.send(content: Data("HTTP/1.1 \(status) \(status == 200 ? "OK" : "Conflict")\r\nContent-Type: \(contentType)\r\nX-MLX-Continuation: 1\r\nConnection: close\r\n\r\n".utf8), completion: .contentProcessed { _ in })
             for (index, delay) in delays.enumerated() {
                 let last = index == delays.count - 1
                 DispatchQueue.global().asyncAfter(deadline: .now() + delay) {

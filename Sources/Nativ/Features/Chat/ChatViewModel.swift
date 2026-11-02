@@ -169,7 +169,8 @@ final class ChatViewModel: ObservableObject {
         let assistantMessageID: UUID
         let resumingResponse: ChatTranscriptMessage?
         var resumingResponseID: UUID? { resumingResponse?.id }
-        var appendsToResponse: Bool { assistantMessageID == resumingResponseID }
+        var reusesResponse: Bool { assistantMessageID == resumingResponseID }
+        var appendsToResponse: Bool { reusesResponse && resumingResponse?.requiresRestart != true }
         let settings: NativSettings
         let accessMode: ChatAccessMode
         let personalizationSnapshot: String
@@ -392,19 +393,29 @@ final class ChatViewModel: ObservableObject {
         return activeRequestSessionID == currentSessionID
     }
 
-    var canResumeResponse: Bool {
+    private var pendingResponseRecovery: ChatResponseResumption? {
         guard let currentSessionID, !isLoadingSessions,
               !isSessionBusy(currentSessionID), canModifySession(currentSessionID),
-              promptEditContext == nil else { return false }
-        return ChatResponseResumption.pending(in: messages) != nil
+              promptEditContext == nil else { return nil }
+        return ChatResponseResumption.pending(in: messages)
+    }
+
+    var canResumeResponse: Bool { pendingResponseRecovery?.action == .resume }
+    var canRestartResponse: Bool { pendingResponseRecovery?.action == .restart }
+
+    var responseRecoveryAction: ChatResponseResumption.Action? {
+        hasPendingPrompt ? nil : pendingResponseRecovery?.action
     }
 
     var shouldResumeFromComposer: Bool {
-        canResumeResponse && !hasPendingPrompt
+        responseRecoveryAction == .resume
     }
 
     var responseResumptionError: String? {
-        currentSessionID.flatMap { resumptionErrorsBySessionID[$0] }
+        if pendingResponseRecovery?.action == .restart {
+            return "This response can no longer be resumed. Restart to generate it again."
+        }
+        return currentSessionID.flatMap { resumptionErrorsBySessionID[$0] }
     }
 
     var currentSessionLiveResponseMetrics: ChatResponseMetrics? {
@@ -480,7 +491,8 @@ final class ChatViewModel: ObservableObject {
             }
             return ChatQueuedPrompt(
                 id: queuedRequest.id,
-                content: queuedRequest.resumingResponseID == nil ? message.content : "Resume response",
+                content: queuedRequest.resumingResponseID == nil ? message.content
+                    : (queuedRequest.resumingResponse?.requiresRestart == true ? "Restart response" : "Resume response"),
                 attachmentCount: queuedRequest.resumingResponseID == nil ? message.imageAttachments.count : 0,
                 position: index + 1
             )
@@ -2097,15 +2109,25 @@ final class ChatViewModel: ObservableObject {
         )
     }
 
-    func resumeResponse(
+    func recoverResponse(
         using appModel: NativModel,
         languageModelSupportsTools: Bool,
         languageModelSupportsVision: Bool
     ) {
-        guard canResumeResponse,
-              let settings = try? submissionSettings(using: appModel),
-              let sessionID = currentSessionID,
-              let resumption = ChatResponseResumption.pending(in: messages) else { return }
+        guard let settings = try? submissionSettings(using: appModel) else { return }
+        self.appModel = appModel
+        recoverResponse(settings: settings,
+                        languageModelSupportsTools: languageModelSupportsTools,
+                        languageModelSupportsVision: languageModelSupportsVision)
+    }
+
+    func recoverResponse(
+        settings: NativSettings,
+        languageModelSupportsTools: Bool,
+        languageModelSupportsVision: Bool
+    ) {
+        guard let resumption = pendingResponseRecovery,
+              let sessionID = currentSessionID else { return }
         enqueueGeneration(
             for: resumption.userMessageID,
             in: sessionID,
@@ -2123,14 +2145,14 @@ final class ChatViewModel: ObservableObject {
         settings: NativSettings,
         languageModelSupportsTools: Bool,
         languageModelSupportsVision: Bool,
-        appModel: NativModel,
+        appModel: NativModel?,
         resumingResponse: ChatTranscriptMessage? = nil
     ) {
         // A send (including prompt regeneration) releases previously attached
         // history. Streaming revisions must not repeatedly reset the reader.
         transcriptSubmissionID = UUID()
         if let modelID = settings.languageModelID {
-            appModel.clearModelLoadFailure(for: modelID)
+            appModel?.clearModelLoadFailure(for: modelID)
         }
         self.appModel = appModel
         documentOmissionsBySessionID[sessionID] = nil
@@ -2777,7 +2799,8 @@ final class ChatViewModel: ObservableObject {
                             // A failed continuation must not replace the answer
                             // the user had before pressing Play.
                             finishActiveAssistantAsCancelled(in: queuedRequest.sessionID)
-                            resumptionErrorsBySessionID[queuedRequest.sessionID] = error.localizedDescription
+                            recordResumptionFailure(error, responseID: activeAssistantMessageID,
+                                                    in: queuedRequest.sessionID)
                         } else {
                             failAssistantMessage(
                                 activeAssistantMessageID,
@@ -3646,7 +3669,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func insertAssistantMessage(for queuedRequest: QueuedChatRequest) -> Bool {
-        if queuedRequest.appendsToResponse, let response = queuedRequest.resumingResponse {
+        if queuedRequest.reusesResponse, let response = queuedRequest.resumingResponse {
             return updateMessage(response.id, in: queuedRequest.sessionID) { message in
                 message = ChatResponseResumption.streamingMessage(from: response, settings: queuedRequest.settings)
             }
@@ -3849,6 +3872,18 @@ final class ChatViewModel: ObservableObject {
             )
             anchorID = id
         }
+    }
+
+    func recordResumptionFailure(_ error: Error, responseID: UUID, in sessionID: UUID) {
+        resumptionErrorsBySessionID[sessionID] = error.localizedDescription
+        guard (error as? NativChatError)?.isContinuationUnavailable == true,
+              message(responseID, in: sessionID)?.continuation != nil else { return }
+        updateMessage(responseID, in: sessionID) { message in
+            message.continuation = nil
+            message.requiresRestart = true
+        }
+        resumptionErrorsBySessionID[sessionID] = nil
+        persistSession(sessionID, updateTimestamp: true)
     }
 
     private func finishActiveAssistantAsCancelled(in sessionID: UUID) {

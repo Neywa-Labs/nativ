@@ -30,6 +30,27 @@ public enum NativChatError: Error, LocalizedError, CustomStringConvertible {
     public var errorDescription: String? {
         description
     }
+
+    /// The continuation API currently reports these failures as messages, without
+    /// a machine-readable error code. Other conflicts and transport errors may be retried.
+    public var isContinuationUnavailable: Bool {
+        let message: String
+        switch self {
+        case .httpStatus(409, let body):
+            message = NativServerErrorMessage.detail(from: body) ?? body
+        case .serverError(let detail):
+            message = detail
+        default:
+            return false
+        }
+        return [
+            "This response checkpoint is no longer available. Regenerate the response to continue.",
+            "The inference checkpoint is no longer available. Regenerate the response.",
+            "The inference checkpoint expired. Regenerate the response.",
+            "The inference checkpoint was evicted to release cache memory. Regenerate the response.",
+            "The model was unloaded. Regenerate the response.",
+        ].contains(message.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
 }
 
 public struct MLXChatMessage: Codable, Equatable, Sendable {

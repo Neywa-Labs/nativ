@@ -211,11 +211,24 @@ struct ChatPastedText: Identifiable, Equatable, Codable {
 }
 
 struct ChatResponseResumption: Equatable {
+    enum Action {
+        case resume
+        case restart
+
+        var title: String { self == .restart ? "Restart response" : "Resume response" }
+        var systemImage: String { self == .restart ? "arrow.clockwise" : "play.fill" }
+    }
+
     let userMessageID: UUID
     let responseMessageID: UUID
+    var action: Action = .resume
 
     static func streamingMessage(from response: ChatTranscriptMessage, settings: NativSettings) -> ChatTranscriptMessage {
-        var message = response
+        // Keep the partial answer until Restart is explicitly chosen, then reuse
+        // its row with an empty response. Earlier messages and tool receipts stay intact.
+        var message = response.requiresRestart
+            ? ChatTranscriptMessage(id: response.id, role: .assistant, content: "")
+            : response
         if message.role == .error || message.content == "Response canceled." { message.content = "" }
         message.role = .assistant
         message.isStreaming = true
@@ -232,7 +245,8 @@ struct ChatResponseResumption: Equatable {
         guard let response = messages.last(where: { $0.role != .tool }),
               response.isInterrupted, !response.isStreaming,
               let user = messages.last(where: { $0.role == .user }) else { return nil }
-        return Self(userMessageID: user.id, responseMessageID: response.id)
+        return Self(userMessageID: user.id, responseMessageID: response.id,
+                    action: response.requiresRestart ? .restart : .resume)
     }
 
     /// Tool cancellation can finish after Stop is pressed. Resolve the insertion
@@ -272,6 +286,7 @@ struct ChatTranscriptMessage: Identifiable, Equatable, Codable {
     var createdAt: Date
     var isStreaming: Bool
     var isInterrupted = false
+    var requiresRestart = false
     var continuation: MLXGenerationContinuation?
     var isThinkingEnabled: Bool
     var thinkingDuration: TimeInterval?
@@ -335,6 +350,7 @@ struct ChatTranscriptMessage: Identifiable, Equatable, Codable {
         case createdAt
         case isStreaming
         case isInterrupted
+        case requiresRestart
         case continuation
         case isThinkingEnabled
         case thinkingDuration
@@ -362,6 +378,7 @@ struct ChatTranscriptMessage: Identifiable, Equatable, Codable {
         createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         isStreaming = false
         isInterrupted = try container.decodeIfPresent(Bool.self, forKey: .isInterrupted) ?? false
+        requiresRestart = try container.decodeIfPresent(Bool.self, forKey: .requiresRestart) ?? false
         continuation = try container.decodeIfPresent(MLXGenerationContinuation.self, forKey: .continuation)
         isThinkingEnabled =
             try container.decodeIfPresent(Bool.self, forKey: .isThinkingEnabled) ?? false
@@ -404,6 +421,7 @@ struct ChatTranscriptMessage: Identifiable, Equatable, Codable {
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(false, forKey: .isStreaming)
         if isInterrupted { try container.encode(true, forKey: .isInterrupted) }
+        if requiresRestart { try container.encode(true, forKey: .requiresRestart) }
         try container.encodeIfPresent(continuation, forKey: .continuation)
         try container.encode(isThinkingEnabled, forKey: .isThinkingEnabled)
         try container.encodeIfPresent(thinkingDuration, forKey: .thinkingDuration)
