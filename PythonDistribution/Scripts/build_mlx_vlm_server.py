@@ -619,11 +619,9 @@ def site_packages_dir(output: Path) -> Path:
 
 
 def install_overlay(output: Path) -> None:
-    packages = site_packages_dir(output)
-    # Continuation now belongs to mlx_vlm.server; remove older bundled overlays.
-    (packages / "nativ_resumption.py").unlink(missing_ok=True)
-    log(f"Installing server overlay {OVERLAY_SERVER.name}")
-    shutil.copy2(OVERLAY_SERVER, packages / OVERLAY_SERVER.name)
+    destination = site_packages_dir(output) / OVERLAY_SERVER.name
+    log(f"Installing metrics overlay {OVERLAY_SERVER.name}")
+    shutil.copy2(OVERLAY_SERVER, destination)
 
 
 def install_model_capabilities_manifest(output: Path) -> None:
