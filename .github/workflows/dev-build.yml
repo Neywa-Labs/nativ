@@ -66,7 +66,6 @@ jobs:
             -only-testing:NativTests/MCPServerCatalogTests \
             -only-testing:NativTests/ChatProjectStoreTests \
             -only-testing:NativTests/ChatCompactionTests \
-            -only-testing:NativTests/ChatResponseResumptionTests \
             -only-testing:NativTests/ChatFileWriteToolTests \
             -only-testing:NativTests/ChatReadFileToolTests \
             -only-testing:NativTests/AudioAnalyticsStoreTests \
@@ -88,6 +87,7 @@ jobs:
             -only-testing:NativTests/MLXImageModelResolverTests \
             -only-testing:NativTests/NativModelTypeRegistryDrafterTests \
             -only-testing:NativTests/ChatResponseSpeechTests \
+            -only-testing:NativTests/ChatResponseResumptionTests \
             -only-testing:NativTests/NativAudioSpeechClientTests \
             -only-testing:NativTests/HuggingFaceCapabilityFilterTests \
             -only-testing:NativTests/SystemTelemetryTests \
