@@ -144,6 +144,9 @@ private final class ModelMenuRowView: NSView {
             case .imageEditing:
                 symbolName = "photo.on.rectangle.angled"
                 description = capability.displayName
+            case .meshGeneration:
+                symbolName = "cube"
+                description = capability.displayName
             case .speechToText:
                 symbolName = "captions.bubble.fill"
                 description = capability.displayName

@@ -515,22 +515,27 @@ def install_requirements(
     env = os.environ.copy()
     env["PYTHONNOUSERSITE"] = "1"
 
-    command = [
-        str(python),
-        "-m",
-        "pip",
-        "install",
-        "--only-binary=:all:",
-        "-r",
-        str(requirements),
-    ]
+    overrides = {}
     if mlx_vlm_source:
         log(f"Resolving requirements with local mlx-vlm source {mlx_vlm_source}")
-        command.append(str(mlx_vlm_source))
+        overrides["mlx-vlm"] = mlx_vlm_source
     if mlx_audio_source:
         log(f"Resolving requirements with local mlx-audio source {mlx_audio_source}")
-        command.append(str(mlx_audio_source))
-    run([*command, *extra_pip_args], env=env)
+        overrides["mlx-audio"] = mlx_audio_source
+    # Replace the release pin when a developer explicitly selects local source;
+    # passing both a Git URL and a local path makes pip resolve two candidates.
+    with tempfile.TemporaryDirectory(prefix="nativ-requirements-") as directory:
+        resolved = Path(directory) / "requirements.txt"
+        resolved.write_text("\n".join(
+            line for line in requirements.read_text().splitlines()
+            if not any(re.match(rf"^{re.escape(name)}(?=\s|[<>=!~\[]|$)", line)
+                       for name in overrides)
+        ) + "\n")
+        run([
+            str(python), "-m", "pip", "install", "--only-binary=:all:",
+            "-r", str(resolved), *(str(source) for source in overrides.values()),
+            *extra_pip_args,
+        ], env=env)
 
 
 def install_local_mlx_vlm(
@@ -641,7 +646,7 @@ def verify_distribution(output: Path, *, expect_mlx_vlm: bool) -> None:
                 str(python),
                 "-c",
                 "import importlib.util; "
-                "raise SystemExit(0 if importlib.util.find_spec('mlx_vlm.server') else 1)",
+                "raise SystemExit(0 if importlib.util.find_spec('mlx_vlm.server.meshes') else 1)",
             ]
         )
         run(

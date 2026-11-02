@@ -1596,6 +1596,11 @@ private struct ServerEndpoint: Identifiable {
         .init(method: .post, path: "/v1/audio/translations", category: .openAI),
         .init(method: .post, path: "/v1/messages", category: .anthropic),
         .init(method: .post, path: "/v1/messages/count_tokens", category: .anthropic),
+        .init(method: .post, path: "/v1/meshes", category: .threeD),
+        .init(method: .get, path: "/v1/meshes", category: .threeD),
+        .init(method: .get, path: "/v1/meshes/{mesh_id}", category: .threeD),
+        .init(method: .get, path: "/v1/meshes/{mesh_id}/content", category: .threeD),
+        .init(method: .delete, path: "/v1/meshes/{mesh_id}", category: .threeD),
         .init(method: .get, path: "/health", category: .metrics),
         .init(method: .get, path: "/metrics", category: .metrics),
         .init(method: .get, path: "/v1/cache/stats", category: .metrics),
@@ -1607,6 +1612,7 @@ private struct ServerEndpoint: Identifiable {
 private enum ServerEndpointCategory: String, CaseIterable, Identifiable {
     case openAI
     case anthropic
+    case threeD
     case metrics
 
     var id: String { rawValue }
@@ -1615,6 +1621,7 @@ private enum ServerEndpointCategory: String, CaseIterable, Identifiable {
         switch self {
         case .openAI: "OpenAI"
         case .anthropic: "Anthropic"
+        case .threeD: "3D"
         case .metrics: "Metrics"
         }
     }

@@ -33,6 +33,7 @@ enum LocalModelCapability: String, CaseIterable, Hashable, Sendable {
     case video
     case imageGeneration
     case imageEditing
+    case meshGeneration
     case speechToText
     case textToSpeech
     case embeddings
@@ -55,6 +56,8 @@ enum LocalModelCapability: String, CaseIterable, Hashable, Sendable {
             "Image Generation"
         case .imageEditing:
             "Image Editing"
+        case .meshGeneration:
+            "3D Generation"
         case .speechToText:
             "Speech-to-Text"
         case .textToSpeech:
@@ -1673,6 +1676,10 @@ enum LocalModelDiscovery {
             model: model, config: config, at: snapshotURL, fileManager: fileManager
         )
         var capabilities = Set<LocalModelCapability>()
+
+        if ModelPrimaryTaskResolver.isMeshGenerationConfig(config) {
+            capabilities.insert(.meshGeneration)
+        }
 
         let drafterConfiguration = DrafterModelConfiguration(config: config)
         if MLXDrafterModelResolver.shared.metadata(for: drafterConfiguration) != nil {

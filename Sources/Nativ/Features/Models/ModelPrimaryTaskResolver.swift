@@ -15,6 +15,10 @@ enum ModelPrimaryTask: Equatable, Sendable {
 }
 
 enum ModelPrimaryTaskResolver {
+    static func isMeshGenerationConfig(_ config: [String: Any]) -> Bool {
+        (config["denoiser"] as? [String: Any])?["name"] as? String == "LatentSeqMMFlowModel"
+    }
+
     static let bundledRegistryResult = Result { try Nativ.modelTypeRegistry() }
     static let bundledRegistry = try? bundledRegistryResult.get()
 
@@ -29,6 +33,7 @@ enum ModelPrimaryTaskResolver {
         hasEmbeddingLayout: Bool = false,
         registry: NativModelTypeRegistry? = bundledRegistry
     ) -> ModelPrimaryTask {
+        if isMeshGenerationConfig(config) { return .nonLanguage }
         guard let registry,
               let modelType = config["model_type"] as? String
         else {

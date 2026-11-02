@@ -13,6 +13,7 @@ For running Nativ, building from source, and the project layout, see the
 |---|---|
 | [Chat](features/chat.md) | Conversations, sessions, multiple windows, model and tool consent, image generation, and the artifacts gallery. |
 | [Models](features/models.md) | Model discovery, downloads, capabilities, per-model configuration, speculative decoding, and how the server loads a model. |
+| [3D](features/three-d.md) | Single-image Idol generation, job status, local history, and Gaussian-splat PLY export. |
 | [Voice](features/voice.md) | Voice dictation, global shortcuts, hands-free and push-to-talk capture, transcription, and permissions. |
 | [Scheduled](features/routines.md) | Saved prompts that run on a schedule with task-specific capabilities. |
 | [Integrations](features/integrations.md) | Serving local models over OpenAI- and Anthropic-compatible APIs, MCP host usage, and per-tool coding-agent and editor setup. |

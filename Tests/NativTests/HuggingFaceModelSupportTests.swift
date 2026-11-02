@@ -2,6 +2,18 @@ import NativServerKit
 import XCTest
 
 final class HuggingFaceModelSupportTests: XCTestCase {
+    func testIdolConfigWithoutModelTypeIsRecognizedAs3D() throws {
+        let payload: [String: Any] = [
+            "id": "speridlabs/idol", "tags": [],
+            "config": ["denoiser": ["name": "LatentSeqMMFlowModel"]],
+        ]
+        let model = try JSONDecoder().decode(
+            HuggingFaceModel.self, from: JSONSerialization.data(withJSONObject: payload)
+        )
+        XCTAssertEqual(model.support, .supported)
+        XCTAssertEqual(model.capabilities, [.meshGeneration])
+    }
+
     func testBundledDiarizationModelIsSupported() throws {
         // Matches the Hub metadata that previously produced an Unsupported badge.
         let payload: [String: Any] = [

@@ -14,6 +14,24 @@ sys.path.pop(0)
 
 
 class PythonResourceReuseTests(unittest.TestCase):
+    def test_local_source_replaces_git_pin_without_removing_other_requirements(self):
+        with tempfile.TemporaryDirectory() as directory:
+            requirements = Path(directory) / "requirements.txt"
+            requirements.write_text("mlx-vlm @ git+https://example.com/repo@commit\nmlx-audio>=0.6.2\nmlx>=0.32.0\n")
+            def check_command(command, **kwargs):
+                resolved = Path(command[command.index("-r") + 1]).read_text()
+                self.assertNotIn("mlx-vlm", resolved)
+                self.assertIn("mlx-audio>=0.6.2", resolved)
+                self.assertIn("mlx>=0.32.0", resolved)
+                self.assertIn("/local source/mlx-vlm", command)
+            with patch.object(builder, "run", side_effect=check_command) as run:
+                builder.install_requirements(
+                    Path("/python"), requirements=requirements,
+                    mlx_vlm_source=Path("/local source/mlx-vlm"),
+                    mlx_audio_source=None, extra_pip_args=[],
+                )
+                run.assert_called_once()
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

@@ -53,6 +53,7 @@ extension ControlPanelView {
                 mcpHost: mcpHost,
                 extensionManager: extensionManager,
                 imageGeneration: imageGeneration,
+                meshGeneration: dependencies.meshGeneration,
                 projects: projects,
                 showsConfiguration: $isModelConfigurationVisible,
                 onExploreImageModels: navigation.openImageModelDiscovery,
@@ -251,6 +252,7 @@ struct ChatWorkspaceView: View {
     let mcpHost: MCPHostManager
     let extensionManager: NativExtensionManager
     let imageGeneration: ImageGenerationViewModel
+    let meshGeneration: MeshGenerationViewModel
     let projects: ChatProjectStore
     @Binding var showsConfiguration: Bool
     let onExploreImageModels: (ChatImageOperation) -> Void
@@ -279,6 +281,11 @@ struct ChatWorkspaceView: View {
                     workspaceMode: mode,
                     onSelectWorkspaceMode: onSelectMode,
                     onExploreImageModels: { onExploreImageModels(.generate) }
+                )
+            case .threeD:
+                MeshGenerationView(
+                    model: model, viewModel: meshGeneration,
+                    onSelectWorkspaceMode: onSelectMode
                 )
             }
         }

@@ -10,6 +10,7 @@ final class ControlPanelSharedDependencies {
     let projects = ChatProjectStore()
     let chatSearch = ChatSearchLibrary(storageURL: ChatSearchStore.defaultURL)
     let fileIndex = ArtifactFileIndexCoordinator()
+    let meshGeneration = MeshGenerationViewModel()
     private let artifactChangeOrigin = UUID()
     lazy var artifactTrash = ArtifactTrash(
         isActive: { [inferenceActivity] workspace, id in
@@ -40,6 +41,7 @@ final class ControlPanelDependencies: ObservableObject {
     let fileIndex: ArtifactFileIndexCoordinator
     let chatSearch: ChatSearchLibrary
     let artifactTrash: ArtifactTrash
+    let meshGeneration: MeshGenerationViewModel
 
     lazy var chat = ChatViewModel(
         windowID: windowID,
@@ -73,5 +75,6 @@ final class ControlPanelDependencies: ObservableObject {
         fileIndex = shared.fileIndex
         chatSearch = shared.chatSearch
         artifactTrash = shared.artifactTrash
+        meshGeneration = shared.meshGeneration
     }
 }

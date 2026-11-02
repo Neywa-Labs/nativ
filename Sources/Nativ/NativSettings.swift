@@ -1443,7 +1443,10 @@ struct NativSettings: Codable, Equatable {
     var launchEnvironment: [String: String] {
         let settings = normalized()
         var environment = [
-            "HF_HUB_CACHE": settings.expandedModelSearchPath
+            "HF_HUB_CACHE": settings.expandedModelSearchPath,
+            "MLX_VLM_MESH_OUTPUT_DIR": FileManager.default.urls(
+                for: .cachesDirectory, in: .userDomainMask
+            )[0].appendingPathComponent("Nativ/meshes", isDirectory: true).path,
         ]
 
         if let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String {

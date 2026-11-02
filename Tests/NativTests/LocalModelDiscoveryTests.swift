@@ -2,6 +2,18 @@ import Foundation
 import XCTest
 
 final class LocalModelDiscoveryTests: XCTestCase {
+    func testIdolIs3DAndExcludedFromChatModels() async throws {
+        let snapshot = snapshotURL(repoID: "speridlabs/idol")
+        try writeJSON(["denoiser": ["name": "LatentSeqMMFlowModel"]],
+                      to: snapshot.appendingPathComponent("config.json"))
+        try write("weights", to: snapshot.appendingPathComponent("model.safetensors"))
+        let models = try await LocalModelDiscovery.scan(searchPaths: searchPaths)
+        let model = try XCTUnwrap(models.first { $0.repoID == "speridlabs/idol" })
+        XCTAssertTrue(model.capabilities.contains(.meshGeneration))
+        XCTAssertFalse(model.capabilities.contains(.text))
+        XCTAssertFalse(model.isEligibleForLanguageModelPicker)
+    }
+
     private var temporaryCache: URL!
 
     private var searchPaths: LocalModelSearchPaths {

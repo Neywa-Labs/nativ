@@ -25,6 +25,8 @@ Available routes:
   (with a compaction-capable runtime), `/v1/models`, and image, audio, and
   embeddings routes.
 - Anthropic-compatible: `/v1/messages` and token-counting routes.
+- 3D: `/v1/meshes`, `/v1/meshes/{id}`, and `/v1/meshes/{id}/content` for
+  asynchronous [Idol generation](three-d.md) and PLY downloads.
 - Operational: `/health`, `/metrics`, cache statistics, cache reset, and model unload.
 
 External tools consume these endpoints — see [Integrations](integrations.md).

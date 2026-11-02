@@ -248,7 +248,8 @@ enum HuggingFaceCapabilityFilter {
     static func resolveCapabilities(
         pipelineTag: String?,
         tags: [String],
-        configIdentifiesDrafter: Bool
+        configIdentifiesDrafter: Bool,
+        configIdentifiesMesh: Bool = false
     ) -> Set<LocalModelCapability> {
         let pipeline = pipelineTag?.lowercased() ?? ""
         let normalizedTags = tags.map { $0.lowercased() }
@@ -265,6 +266,10 @@ enum HuggingFaceCapabilityFilter {
         )
         if configIdentifiesDrafter {
             capabilities.insert(.drafter)
+        }
+        if configIdentifiesMesh {
+            capabilities.insert(.meshGeneration)
+            capabilities.remove(.text)
         }
         return capabilities
     }
@@ -388,7 +393,8 @@ struct HuggingFaceModel: Decodable, Identifiable, Equatable, Sendable {
         capabilities = HuggingFaceCapabilityFilter.resolveCapabilities(
             pipelineTag: pipelineTag,
             tags: tags,
-            configIdentifiesDrafter: drafterKind != nil
+            configIdentifiesDrafter: drafterKind != nil,
+            configIdentifiesMesh: supportConfiguration?.isMeshGeneration == true
         )
     }
 }

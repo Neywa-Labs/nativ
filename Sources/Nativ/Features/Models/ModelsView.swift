@@ -3432,6 +3432,7 @@ extension LocalModelCapability {
         case .video: "film"
         case .imageGeneration: "photo.badge.plus"
         case .imageEditing: "photo.on.rectangle.angled"
+        case .meshGeneration: "cube"
         case .speechToText: "captions.bubble"
         case .textToSpeech: "speaker.wave.2"
         case .embeddings: "circle.grid.3x3"

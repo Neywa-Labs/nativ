@@ -40,6 +40,7 @@ Full feature and contributor documentation lives in **[`Docs/`](Docs/README.md)*
 | **Multiple windows** | Open independent workspaces with Command + Shift + N while sharing the same inference server, loaded models, and settings. |
 | **Shared work pane** | Open document, code, HTML, and website tabs beside chat. Edit and preview work, discuss selected source, and let agents update shared items or operate the same browser page. |
 | **Image generation and editing** | Generate and edit images locally with compatible MLX image models in a dedicated Images tab. |
+| **Image to 3D** | Generate Gaussian-splat PLY files from one image with Idol in the 3D workspace. Keep a local history and export to a splat viewer. See the [3D guide](Docs/features/three-d.md). |
 | **Model library** | Discover installed MLX models, browse and download compatible models from Hugging Face with fit warnings for your memory, store the cache on an external APFS drive, inspect capabilities, switch models, or remove old ones. Preload separate language, image-generation, speech, and embedding models at once, with a warning if the combination would exceed your Mac's memory. |
 | **Performance analytics** | Track request volume, token usage, time to first token, decode speed, model performance, and recent activity. |
 | **System monitor** | Inspect live per-core CPU load, GPU utilization, unified memory and swap pressure, disk throughput, capacity, SMART health, and thermal and power sensors. |

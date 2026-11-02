@@ -397,6 +397,11 @@ final class NativModel: ChatModelSwitchingSurface {
         return settingsAppliedAtServerStart.serverBaseURL
     }
 
+    var activeServerAPIKey: String? {
+        guard isRunning else { return nil }
+        return settingsAppliedAtServerStart?.serverAPIKey
+    }
+
     /// Called only by an explicit processing action or a newly completed meeting.
     /// Readiness is checked separately from process launch, including with native ASR.
     func prepareAudioAnalysisServer() async throws -> NativAudioClient {

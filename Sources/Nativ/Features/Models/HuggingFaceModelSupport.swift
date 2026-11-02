@@ -16,6 +16,9 @@ struct HuggingFaceModelSupportConfiguration: Decodable, Equatable, Sendable {
     let hasAudioConfig: Bool
     let hasDFlashConfig: Bool
     let usesCustomCode: Bool
+    let isMeshGeneration: Bool
+
+    private struct Denoiser: Decodable { let name: String }
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -26,6 +29,7 @@ struct HuggingFaceModelSupportConfiguration: Decodable, Equatable, Sendable {
         case dFlashConfig = "dflash_config"
         case modelFile = "model_file"
         case autoMap = "auto_map"
+        case denoiser
     }
 
     init(from decoder: Decoder) throws {
@@ -55,6 +59,8 @@ struct HuggingFaceModelSupportConfiguration: Decodable, Equatable, Sendable {
         let modelFile = try? container.decode(String.self, forKey: .modelFile)
         let hasAutoMap = try container.hasNonNullValue(forKey: .autoMap)
         usesCustomCode = modelFile?.isEmpty == false || hasAutoMap
+        isMeshGeneration = (try? container.decode(Denoiser.self, forKey: .denoiser))?.name
+            == "LatentSeqMMFlowModel"
     }
 }
 
@@ -92,6 +98,8 @@ struct HuggingFaceModelSupportClassifier: Sendable {
         if configuration.hasDFlashConfig {
             return .unknown
         }
+
+        if configuration.isMeshGeneration { return .supported }
 
         // Match the runtime's primary type, using the speculator type only
         // when model_type is absent or empty.
