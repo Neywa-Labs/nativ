@@ -421,7 +421,7 @@ struct ChatComposer<ContextHeader: View>: View {
                                 send()
                             }
                         } label: {
-                            Image(systemName: showsStopButton ? "stop.fill" : recoveryAction?.systemImage ?? "arrow.up")
+                            Image(systemName: showsStopButton ? "stop.fill" : showsResumeButton ? "play.fill" : "arrow.up")
                                 .font(.system(size: showsStopButton ? 10 : 15, weight: .semibold))
                                 .foregroundStyle(.white)
                                 .frame(width: 32, height: 32)
@@ -429,9 +429,9 @@ struct ChatComposer<ContextHeader: View>: View {
                                 .contentShape(.circle)
                         }
                         .buttonStyle(.plain)
-                        .disabled(!showsStopButton && !effectiveCanSend && !effectiveCanRecover)
+                        .disabled(!showsStopButton && !effectiveCanSend && !effectiveCanResume)
                         .help(actionButtonHelp)
-                        .accessibilityLabel(showsStopButton ? "Stop response" : recoveryAction?.title ?? "Send message")
+                        .accessibilityLabel(showsStopButton ? "Stop response" : showsResumeButton ? "Resume response" : "Send message")
                     }
                     .padding(.leading, 10)
                     .padding(.trailing, 12)
@@ -699,12 +699,12 @@ struct ChatComposer<ContextHeader: View>: View {
         canSend && !hasVisionRejectedAttachment && importedContinuationIsAvailable
     }
 
-    private var recoveryAction: ChatResponseResumption.Action? {
-        viewModel.responseRecoveryAction
+    private var showsResumeButton: Bool {
+        viewModel.shouldResumeFromComposer
     }
 
-    private var effectiveCanRecover: Bool {
-        recoveryAction != nil && canCompose && !model.isModelLoading && importedContinuationIsAvailable
+    private var effectiveCanResume: Bool {
+        showsResumeButton && canCompose && !model.isModelLoading && importedContinuationIsAvailable
     }
 
     private var attachmentNotices: [ChatAttachmentNotice] {
@@ -1187,7 +1187,7 @@ struct ChatComposer<ContextHeader: View>: View {
     }
 
     private var actionButtonColor: Color {
-        if showsStopButton || effectiveCanSend || effectiveCanRecover {
+        if showsStopButton || effectiveCanSend || effectiveCanResume {
             return .accentColor
         }
         return Color(nsColor: .tertiaryLabelColor)
@@ -1219,8 +1219,8 @@ struct ChatComposer<ContextHeader: View>: View {
         if showsStopButton {
             return "Stop response"
         }
-        if let recoveryAction {
-            return unavailableReason ?? "\(recoveryAction.title) (Return)"
+        if showsResumeButton {
+            return unavailableReason ?? "Resume response (Return)"
         }
         if let blockingNotice = attachmentNotices.first(where: {
             $0.severity == .error || $0.severity == .progress
@@ -1238,9 +1238,9 @@ struct ChatComposer<ContextHeader: View>: View {
     }
 
     private func send() {
-        if recoveryAction != nil {
-            guard effectiveCanRecover else { return }
-            viewModel.recoverResponse(
+        if showsResumeButton {
+            guard effectiveCanResume else { return }
+            viewModel.resumeResponse(
                 using: model,
                 languageModelSupportsTools: selectedLocalModel?.capabilities.contains(.tools) == true,
                 languageModelSupportsVision: !modelLacksVision

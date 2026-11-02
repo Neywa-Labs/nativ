@@ -159,7 +159,7 @@ private final class RecoveryRequestRecorder: @unchecked Sendable {
 
 @MainActor
 final class ChatResponseResumptionTests: XCTestCase {
-    func testOnlyUnavailableCheckpointsRequireRestart() {
+    func testOnlyUnavailableCheckpointsEndResumption() {
         for message in [
             "This response checkpoint is no longer available. Regenerate the response to continue.",
             "The inference checkpoint is no longer available. Regenerate the response.",
@@ -178,7 +178,7 @@ final class ChatResponseResumptionTests: XCTestCase {
         }
     }
 
-    func testExpiredCheckpointOffersPersistentRestartAndSendsFreshRequestOnBothAPIs() async throws {
+    func testExpiredCheckpointReturnsToNormalComposerAndPersistsAcrossBothAPIs() async throws {
         for responses in [false, true] {
             let requests = RecoveryRequestRecorder()
             let server = try ChatTimeoutHTTPFixture(delays: [0], responder: { headers, data in
@@ -210,55 +210,44 @@ final class ChatResponseResumptionTests: XCTestCase {
                                          serverPort: try XCTUnwrap(url.port), compactionEnabled: responses)
             chat.draft = "Keep this draft"
 
-            chat.recoverResponse(settings: settings, languageModelSupportsTools: false, languageModelSupportsVision: false)
+            chat.resumeResponse(settings: settings, languageModelSupportsTools: false, languageModelSupportsVision: false)
             try await waitForRecovery(chat)
 
             XCTAssertEqual(requests.values.count, 1, "Expiry must not silently regenerate")
             XCTAssertEqual(chat.messages.map(\.id), original.map(\.id))
             XCTAssertEqual(chat.messages.last?.content, response.content)
             XCTAssertEqual(chat.messages.last?.reasoningContent, response.reasoningContent)
-            XCTAssertTrue(chat.messages.last?.isInterrupted == true)
-            XCTAssertTrue(chat.messages.last?.requiresRestart == true)
+            XCTAssertFalse(chat.messages.last?.isInterrupted == true)
             XCTAssertNil(chat.messages.last?.continuation)
             XCTAssertFalse(chat.canResumeResponse)
-            XCTAssertTrue(chat.canRestartResponse)
             XCTAssertEqual(chat.draft, "Keep this draft")
-            XCTAssertNil(chat.responseRecoveryAction, "A draft keeps the composer in Send mode")
+            XCTAssertTrue(chat.canSend(isRunning: true, selectedModelID: "model"))
+            XCTAssertFalse(chat.shouldResumeFromComposer)
+            XCTAssertNil(chat.responseResumptionError)
             chat.draft = ""
-            XCTAssertEqual(chat.responseRecoveryAction, .restart)
-            XCTAssertEqual(chat.responseRecoveryAction?.systemImage, "arrow.clockwise")
-            XCTAssertEqual(chat.responseRecoveryAction?.title, "Restart response")
-            XCTAssertTrue(chat.responseResumptionError?.contains("Restart") == true)
+            XCTAssertFalse(chat.shouldResumeFromComposer, "An empty composer returns to normal Send mode")
+            XCTAssertFalse(chat.canSend(isRunning: true, selectedModelID: "model"))
 
             let reloaded = ChatViewModel(sessionDirectory: directory)
             try await waitForRecovery(reloaded)
             XCTAssertEqual(reloaded.currentSessionID, sessionID)
-            XCTAssertEqual(reloaded.responseRecoveryAction, .restart)
+            XCTAssertFalse(reloaded.canResumeResponse)
+            XCTAssertFalse(reloaded.shouldResumeFromComposer)
             XCTAssertNil(reloaded.messages.last?.continuation)
-            reloaded.beginEditingUserMessage(try XCTUnwrap(original.first?.id))
-            XCTAssertNil(reloaded.responseRecoveryAction)
-            reloaded.cancelPromptEditing()
-            reloaded.recoverResponse(settings: settings, languageModelSupportsTools: false, languageModelSupportsVision: false)
+            XCTAssertNil(reloaded.responseResumptionError)
+            reloaded.resumeResponse(settings: settings, languageModelSupportsTools: false, languageModelSupportsVision: false)
             try await waitForRecovery(reloaded)
 
-            XCTAssertEqual(requests.values.count, 2)
-            let fresh = try XCTUnwrap(requests.values.last)
-            XCTAssertNil(fresh["continuation"])
-            XCTAssertNotEqual(fresh["continue_final_message"], .bool(true))
-            let input = try JSONEncoder().encode(fresh[responses ? "input" : "messages"])
-            let inputText = String(decoding: input, as: UTF8.self)
-            XCTAssertTrue(inputText.contains("Original task"))
-            XCTAssertTrue(inputText.contains("Saved tool result"), "Restart must retain completed tool receipts")
-            XCTAssertFalse(inputText.contains(response.content), "Restart must not continue the expired prefix")
-            XCTAssertFalse(inputText.contains(response.reasoningContent))
-            XCTAssertEqual(reloaded.messages.map(\.id), original.map(\.id), "Restart reuses the response row")
+            XCTAssertEqual(requests.values.count, 1, "The expired checkpoint must not be retried or regenerated")
+            XCTAssertEqual(reloaded.messages.map(\.id), original.map(\.id))
             XCTAssertEqual(Array(reloaded.messages.dropLast()), Array(original.dropLast()))
-            XCTAssertEqual(reloaded.messages.last?.content, "A fresh answer.")
-            XCTAssertEqual(reloaded.messages.last?.reasoningContent, "")
-            XCTAssertFalse(reloaded.messages.last?.isInterrupted == true)
-            XCTAssertFalse(reloaded.messages.last?.requiresRestart == true)
-            XCTAssertNil(reloaded.responseRecoveryAction)
-            XCTAssertNil(reloaded.responseResumptionError)
+            XCTAssertEqual(reloaded.messages.last?.content, response.content)
+            XCTAssertEqual(reloaded.messages.last?.reasoningContent, response.reasoningContent)
+            reloaded.draft = "A new question"
+            XCTAssertTrue(reloaded.canSend(isRunning: true, selectedModelID: "model"))
+            let history = ChatViewModel.completionMessages(systemPrompt: "System",
+                transcript: reloaded.messages[...], includesImages: true)
+            XCTAssertEqual(history.last?.textContent, response.content, "The partial answer remains ordinary conversation history")
         }
     }
 
@@ -273,7 +262,7 @@ final class ChatResponseResumptionTests: XCTestCase {
         for error in errors {
             chat.recordResumptionFailure(error, responseID: response.id, in: try XCTUnwrap(chat.currentSessionID))
             XCTAssertEqual(chat.messages, original)
-            XCTAssertEqual(chat.responseRecoveryAction, .resume)
+            XCTAssertTrue(chat.shouldResumeFromComposer)
             XCTAssertEqual(chat.responseResumptionError, error.localizedDescription)
         }
     }
@@ -443,7 +432,26 @@ final class ChatResponseResumptionTests: XCTestCase {
         let legacyData = try JSONEncoder().encode(response)
         XCTAssertFalse(String(decoding: legacyData, as: UTF8.self).contains("isInterrupted"))
         XCTAssertFalse(try JSONDecoder().decode(ChatTranscriptMessage.self, from: legacyData).isInterrupted)
-        XCTAssertFalse(try JSONDecoder().decode(ChatTranscriptMessage.self, from: legacyData).requiresRestart)
+    }
+
+    func testLegacyRestartStateLoadsAsOrdinaryHistory() throws {
+        let user = ChatTranscriptMessage(role: .user, content: "Original task")
+        var response = ChatTranscriptMessage(role: .assistant, content: "A partial answer",
+                                             reasoningContent: "A partial thought")
+        response.isInterrupted = true
+        response.continuation = try JSONDecoder().decode(MLXGenerationContinuation.self,
+            from: Data(#"{"id":"expired","cursor":23,"content":16,"reasoning":0,"responses":true}"#.utf8))
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(response)) as? [String: Any])
+        legacy["requiresRestart"] = true
+        let restored = try JSONDecoder().decode(ChatTranscriptMessage.self,
+            from: JSONSerialization.data(withJSONObject: legacy))
+        XCTAssertEqual(restored.content, response.content)
+        XCTAssertEqual(restored.reasoningContent, response.reasoningContent)
+        XCTAssertFalse(restored.isInterrupted)
+        XCTAssertNil(restored.continuation)
+        XCTAssertNil(ChatResponseResumption.pending(in: [user, restored]))
+        let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(restored)) as? [String: Any])
+        XCTAssertNil(saved["requiresRestart"])
     }
 
     func testLoadedChatOffersResumeWithoutConsumingDraftAndRespectsEditingAndWindowOwnership() async throws {

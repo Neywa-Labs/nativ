@@ -169,8 +169,7 @@ final class ChatViewModel: ObservableObject {
         let assistantMessageID: UUID
         let resumingResponse: ChatTranscriptMessage?
         var resumingResponseID: UUID? { resumingResponse?.id }
-        var reusesResponse: Bool { assistantMessageID == resumingResponseID }
-        var appendsToResponse: Bool { reusesResponse && resumingResponse?.requiresRestart != true }
+        var appendsToResponse: Bool { assistantMessageID == resumingResponseID }
         let settings: NativSettings
         let accessMode: ChatAccessMode
         let personalizationSnapshot: String
@@ -393,29 +392,21 @@ final class ChatViewModel: ObservableObject {
         return activeRequestSessionID == currentSessionID
     }
 
-    private var pendingResponseRecovery: ChatResponseResumption? {
+    private var pendingResponseResumption: ChatResponseResumption? {
         guard let currentSessionID, !isLoadingSessions,
               !isSessionBusy(currentSessionID), canModifySession(currentSessionID),
               promptEditContext == nil else { return nil }
         return ChatResponseResumption.pending(in: messages)
     }
 
-    var canResumeResponse: Bool { pendingResponseRecovery?.action == .resume }
-    var canRestartResponse: Bool { pendingResponseRecovery?.action == .restart }
-
-    var responseRecoveryAction: ChatResponseResumption.Action? {
-        hasPendingPrompt ? nil : pendingResponseRecovery?.action
-    }
+    var canResumeResponse: Bool { pendingResponseResumption != nil }
 
     var shouldResumeFromComposer: Bool {
-        responseRecoveryAction == .resume
+        canResumeResponse && !hasPendingPrompt
     }
 
     var responseResumptionError: String? {
-        if pendingResponseRecovery?.action == .restart {
-            return "This response can no longer be resumed. Restart to generate it again."
-        }
-        return currentSessionID.flatMap { resumptionErrorsBySessionID[$0] }
+        currentSessionID.flatMap { resumptionErrorsBySessionID[$0] }
     }
 
     var currentSessionLiveResponseMetrics: ChatResponseMetrics? {
@@ -491,8 +482,7 @@ final class ChatViewModel: ObservableObject {
             }
             return ChatQueuedPrompt(
                 id: queuedRequest.id,
-                content: queuedRequest.resumingResponseID == nil ? message.content
-                    : (queuedRequest.resumingResponse?.requiresRestart == true ? "Restart response" : "Resume response"),
+                content: queuedRequest.resumingResponseID == nil ? message.content : "Resume response",
                 attachmentCount: queuedRequest.resumingResponseID == nil ? message.imageAttachments.count : 0,
                 position: index + 1
             )
@@ -2109,24 +2099,24 @@ final class ChatViewModel: ObservableObject {
         )
     }
 
-    func recoverResponse(
+    func resumeResponse(
         using appModel: NativModel,
         languageModelSupportsTools: Bool,
         languageModelSupportsVision: Bool
     ) {
         guard let settings = try? submissionSettings(using: appModel) else { return }
         self.appModel = appModel
-        recoverResponse(settings: settings,
+        resumeResponse(settings: settings,
                         languageModelSupportsTools: languageModelSupportsTools,
                         languageModelSupportsVision: languageModelSupportsVision)
     }
 
-    func recoverResponse(
+    func resumeResponse(
         settings: NativSettings,
         languageModelSupportsTools: Bool,
         languageModelSupportsVision: Bool
     ) {
-        guard let resumption = pendingResponseRecovery,
+        guard let resumption = pendingResponseResumption,
               let sessionID = currentSessionID else { return }
         enqueueGeneration(
             for: resumption.userMessageID,
@@ -3669,7 +3659,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func insertAssistantMessage(for queuedRequest: QueuedChatRequest) -> Bool {
-        if queuedRequest.reusesResponse, let response = queuedRequest.resumingResponse {
+        if queuedRequest.appendsToResponse, let response = queuedRequest.resumingResponse {
             return updateMessage(response.id, in: queuedRequest.sessionID) { message in
                 message = ChatResponseResumption.streamingMessage(from: response, settings: queuedRequest.settings)
             }
@@ -3880,7 +3870,7 @@ final class ChatViewModel: ObservableObject {
               message(responseID, in: sessionID)?.continuation != nil else { return }
         updateMessage(responseID, in: sessionID) { message in
             message.continuation = nil
-            message.requiresRestart = true
+            message.isInterrupted = false
         }
         resumptionErrorsBySessionID[sessionID] = nil
         persistSession(sessionID, updateTimestamp: true)
