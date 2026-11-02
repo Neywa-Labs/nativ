@@ -231,6 +231,7 @@ struct ChatResponseResumption: Equatable {
     static func pending(in messages: [ChatTranscriptMessage]) -> Self? {
         guard let response = messages.last(where: { $0.role != .tool }),
               response.isInterrupted, !response.isStreaming,
+              !response.hasExpiredContinuation,
               let user = messages.last(where: { $0.role == .user }) else { return nil }
         return Self(userMessageID: user.id, responseMessageID: response.id)
     }
@@ -273,6 +274,22 @@ struct ChatTranscriptMessage: Identifiable, Equatable, Codable {
     var isStreaming: Bool
     var isInterrupted = false
     var continuation: MLXGenerationContinuation?
+    var continuationExpiresAt: Date?
+
+    var hasExpiredContinuation: Bool {
+        isInterrupted && !isStreaming && continuationExpiresAt.map { $0 <= Date() } == true
+    }
+
+    mutating func markInterrupted(at now: Date = Date()) {
+        isInterrupted = true
+        // Preserve the original deadline if a retry fails before producing a
+        // new checkpoint, or cancellation is reported more than once.
+        if continuationExpiresAt == nil,
+           let timeout = continuation?.idleTimeoutSeconds,
+           timeout.isFinite, timeout >= 0 {
+            continuationExpiresAt = now.addingTimeInterval(timeout)
+        }
+    }
     var isThinkingEnabled: Bool
     var thinkingDuration: TimeInterval?
     var imageAttachments: [ChatImageAttachment]
@@ -337,6 +354,7 @@ struct ChatTranscriptMessage: Identifiable, Equatable, Codable {
         case isInterrupted
         case requiresRestart
         case continuation
+        case continuationExpiresAt
         case isThinkingEnabled
         case thinkingDuration
         case imageAttachments
@@ -364,11 +382,13 @@ struct ChatTranscriptMessage: Identifiable, Equatable, Codable {
         isStreaming = false
         isInterrupted = try container.decodeIfPresent(Bool.self, forKey: .isInterrupted) ?? false
         continuation = try container.decodeIfPresent(MLXGenerationContinuation.self, forKey: .continuation)
+        continuationExpiresAt = try container.decodeIfPresent(Date.self, forKey: .continuationExpiresAt)
         // Older builds persisted an explicit Restart action after expiry.
         // Keep that partial answer as ordinary history without offering Resume.
         if try container.decodeIfPresent(Bool.self, forKey: .requiresRestart) == true {
             isInterrupted = false
             continuation = nil
+            continuationExpiresAt = nil
         }
         isThinkingEnabled =
             try container.decodeIfPresent(Bool.self, forKey: .isThinkingEnabled) ?? false
@@ -412,6 +432,7 @@ struct ChatTranscriptMessage: Identifiable, Equatable, Codable {
         try container.encode(false, forKey: .isStreaming)
         if isInterrupted { try container.encode(true, forKey: .isInterrupted) }
         try container.encodeIfPresent(continuation, forKey: .continuation)
+        try container.encodeIfPresent(continuationExpiresAt, forKey: .continuationExpiresAt)
         try container.encode(isThinkingEnabled, forKey: .isThinkingEnabled)
         try container.encodeIfPresent(thinkingDuration, forKey: .thinkingDuration)
         try container.encode(imageAttachments, forKey: .imageAttachments)

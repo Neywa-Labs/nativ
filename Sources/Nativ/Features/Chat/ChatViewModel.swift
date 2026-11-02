@@ -162,6 +162,13 @@ final class ChatViewModel: ObservableObject {
     weak var mcpHost: MCPHostManager?
     private static let liveDecodeRateRefreshInterval: TimeInterval = 0.25
 
+    private struct ContinuationExpiry: Equatable {
+        let sessionID: UUID
+        let responseID: UUID
+        let checkpointID: String
+        let deadline: Date
+    }
+
     private struct QueuedChatRequest {
         let id: UUID
         let sessionID: UUID
@@ -198,11 +205,16 @@ final class ChatViewModel: ObservableObject {
     }
 
     @Published private(set) var sessions: [ChatSessionSummary] = []
-    @Published private(set) var currentSessionID: UUID?
+    @Published private(set) var currentSessionID: UUID? {
+        didSet { scheduleContinuationExpiry() }
+    }
     @Published private(set) var workState = ChatWorkState()
     @Published private(set) var currentProjectID: UUID?
     @Published private(set) var messages: [ChatTranscriptMessage] = [] {
-        didSet { searchLibrary.invalidate(currentSessionID, from: self) }
+        didSet {
+            searchLibrary.invalidate(currentSessionID, from: self)
+            scheduleContinuationExpiry()
+        }
     }
     @Published private(set) var pendingImageAttachments: [ChatImageAttachment] = [] {
         didSet {
@@ -267,13 +279,17 @@ final class ChatViewModel: ObservableObject {
     }
     @Published private(set) var promptEditContext: ChatPromptEditContext?
     @Published private(set) var composerFocusToken = 0
-    @Published private(set) var activeRequestSessionID: UUID?
+    @Published private(set) var activeRequestSessionID: UUID? {
+        didSet { scheduleContinuationExpiry() }
+    }
     @Published private(set) var sendingStartedAt: Date?
     let transcriptRevision = ChatTranscriptRevision()
     let searchLibrary: ChatSearchLibrary
     @Published private(set) var transcriptSubmissionID: UUID?
     @Published var scrollTargetMessageID: UUID?
-    @Published private(set) var isLoadingSessions = true
+    @Published private(set) var isLoadingSessions = true {
+        didSet { scheduleContinuationExpiry() }
+    }
     @Published private(set) var imageModelSelectionRequests:
         [UUID: ChatImageModelSelectionRequest] = [:]
 
@@ -294,6 +310,8 @@ final class ChatViewModel: ObservableObject {
     private let attachmentValidator: ChatAttachmentValidator
     private var sessionLoadTask: Task<Void, Never>?
     private var activeTask: Task<Void, Never>?
+    private var continuationExpiryTask: Task<Void, Never>?
+    private var scheduledContinuationExpiry: ContinuationExpiry?
     private var activeRequestID: UUID?
     private var activeAssistantMessageID: UUID?
     @Published private var requestQueue: [QueuedChatRequest] = [] {
@@ -301,6 +319,7 @@ final class ChatViewModel: ObservableObject {
             for id in Set(oldValue.map(\.sessionID) + requestQueue.map(\.sessionID)) {
                 searchLibrary.invalidate(id, from: self)
             }
+            scheduleContinuationExpiry()
         }
     }
     private var storedSessions: [ChatSession] = []
@@ -368,6 +387,7 @@ final class ChatViewModel: ObservableObject {
     deinit {
         activeTask?.cancel()
         sessionLoadTask?.cancel()
+        continuationExpiryTask?.cancel()
         attachmentValidationTasks.values.forEach { $0.cancel() }
     }
 
@@ -381,6 +401,7 @@ final class ChatViewModel: ObservableObject {
                 }
                 self.observeInferenceActivity()
                 self.startNextRequestIfNeeded()
+                self.scheduleContinuationExpiry()
             }
         }
     }
@@ -3870,10 +3891,54 @@ final class ChatViewModel: ObservableObject {
               message(responseID, in: sessionID)?.continuation != nil else { return }
         updateMessage(responseID, in: sessionID) { message in
             message.continuation = nil
+            message.continuationExpiresAt = nil
             message.isInterrupted = false
         }
         resumptionErrorsBySessionID[sessionID] = nil
         persistSession(sessionID, updateTimestamp: true)
+    }
+
+    private func scheduleContinuationExpiry() {
+        var expiry: ContinuationExpiry?
+        if let sessionID = currentSessionID, !isLoadingSessions,
+           !isSessionBusy(sessionID), canModifySession(sessionID),
+           let response = messages.last(where: { $0.role != .tool }),
+           response.isInterrupted, !response.isStreaming,
+           let checkpoint = response.continuation,
+           let deadline = response.continuationExpiresAt {
+            expiry = ContinuationExpiry(sessionID: sessionID, responseID: response.id,
+                                        checkpointID: checkpoint.id, deadline: deadline)
+        }
+        guard expiry != scheduledContinuationExpiry else { return }
+        continuationExpiryTask?.cancel()
+        scheduledContinuationExpiry = expiry
+        guard let expiry else {
+            continuationExpiryTask = nil
+            return
+        }
+        continuationExpiryTask = Task { @MainActor [weak self] in
+            // Recheck wall time after waking; cap each sleep for unusually long
+            // server lifetimes rather than overflowing Duration conversion.
+            let delay = min(3_600, max(0, expiry.deadline.timeIntervalSinceNow))
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            guard let self, scheduledContinuationExpiry == expiry else { return }
+            scheduledContinuationExpiry = nil
+            continuationExpiryTask = nil
+            if currentSessionID == expiry.sessionID, !isSessionBusy(expiry.sessionID),
+               canModifySession(expiry.sessionID),
+               let response = message(expiry.responseID, in: expiry.sessionID),
+               response.continuation?.id == expiry.checkpointID,
+               response.hasExpiredContinuation {
+                updateMessage(expiry.responseID, in: expiry.sessionID) { message in
+                    message.isInterrupted = false
+                    message.continuation = nil
+                    message.continuationExpiresAt = nil
+                }
+                resumptionErrorsBySessionID[expiry.sessionID] = nil
+                persistSession(expiry.sessionID, updateTimestamp: false)
+            }
+            scheduleContinuationExpiry()
+        }
     }
 
     private func finishActiveAssistantAsCancelled(in sessionID: UUID) {
@@ -3885,7 +3950,7 @@ final class ChatViewModel: ObservableObject {
         // The assistant may already have finished its tool call while a tool is
         // still running. Preserve that call and its receipts when stopping.
         if !assistant.isStreaming {
-            updateMessage(activeAssistantMessageID, in: sessionID) { $0.isInterrupted = true }
+            updateMessage(activeAssistantMessageID, in: sessionID) { $0.markInterrupted() }
             persistSession(sessionID, updateTimestamp: true)
             return
         }
@@ -3982,6 +4047,7 @@ final class ChatViewModel: ObservableObject {
         }
 
         updateMessage(id, in: sessionID) { message in
+            if event.continuation != nil { message.continuationExpiresAt = nil }
             message.continuation = event.continuation ?? message.continuation
             message.isCompacting = false
             if let toolCalls = event.toolCalls, !toolCalls.isEmpty {
@@ -4057,8 +4123,13 @@ final class ChatViewModel: ObservableObject {
         liveDecodeRateRefreshDates.removeValue(forKey: id)
         updateMessage(id, in: sessionID) { message in
             message.isStreaming = false
-            message.isInterrupted = isCancelled
-            if !isCancelled { message.continuation = nil }
+            if isCancelled {
+                message.markInterrupted()
+            } else {
+                message.isInterrupted = false
+                message.continuation = nil
+                message.continuationExpiresAt = nil
+            }
             message.isCompacting = false
             if let initialResponse, message.content == initialResponse.content {
                 message.content.append(fallbackContent)

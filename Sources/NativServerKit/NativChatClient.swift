@@ -375,6 +375,12 @@ public struct MLXGenerationContinuation: Codable, Equatable, Sendable {
     public let content: Int
     public let reasoning: Int
     public let responses: Bool
+    public let idleTimeoutSeconds: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case id, cursor, content, reasoning, responses
+        case idleTimeoutSeconds = "idle_timeout_seconds"
+    }
 }
 
 public struct MLXChatStreamDelta: Equatable, Sendable {
