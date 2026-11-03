@@ -2,6 +2,126 @@ import XCTest
 @testable import NativServerKit
 
 final class ChatCompactionTests: XCTestCase {
+    func testCachedTokenUsageSurvivesCompletionAndPersistence() throws {
+        for cachedTokens: Int? in [768, 0, nil] {
+            var payload: [String: Any] = [
+                "prompt_tokens": 1000, "completion_tokens": 20, "total_tokens": 1020,
+            ]
+            if let cachedTokens {
+                payload["prompt_tokens_details"] = ["cached_tokens": cachedTokens]
+            }
+            let usage = try JSONDecoder().decode(
+                MLXChatUsage.self, from: JSONSerialization.data(withJSONObject: payload)
+            )
+            XCTAssertEqual(usage.cachedTokens, cachedTokens)
+            let completion = MLXChatCompletion(
+                model: "test-model", content: "Hello", reasoningContent: nil,
+                toolCalls: [], finishReason: "stop", usage: usage, requestElapsedSeconds: 1
+            )
+            let metrics = ChatResponseMetrics(completion: completion)
+            let restored = try JSONDecoder().decode(
+                ChatResponseMetrics.self, from: JSONEncoder().encode(metrics)
+            )
+            XCTAssertEqual(restored.cachedTokens, cachedTokens)
+            XCTAssertEqual(restored.promptTokens, 1000)
+            XCTAssertEqual(restored.totalTokens, 1020)
+        }
+        let legacy = try JSONDecoder().decode(
+            ChatResponseMetrics.self, from: Data(#"{"totalTokens":1020}"#.utf8)
+        )
+        XCTAssertNil(legacy.cachedTokens)
+        XCTAssertNil(legacy.promptTokens)
+        XCTAssertNil(legacy.cacheReuseFraction)
+    }
+
+    func testCacheReuseUsesPromptTokensAndHandlesUnavailableCounts() {
+        let cases: [(prompt: Int?, cached: Int?, fresh: Int?, fraction: Double?)] = [
+            (1000, 768, 232, 0.768),
+            (1000, 0, 1000, 0),
+            (1000, 1000, 0, 1),
+            (0, 0, 0, nil),
+            (nil, 768, nil, nil),
+            (1000, nil, nil, nil),
+            (1000, 1001, nil, nil),
+            (1000, -1, nil, nil),
+        ]
+        for value in cases {
+            let metrics = ChatResponseMetrics(
+                totalTokens: 1200, generatedTokens: 200,
+                cachedTokens: value.cached, promptTokens: value.prompt
+            )
+            XCTAssertEqual(metrics.uncachedPromptTokens, value.fresh)
+            XCTAssertEqual(metrics.cacheReuseFraction, value.fraction)
+        }
+    }
+
+    func testResponsesStreamPreservesCachedTokensIncludingZeroAndMissingUsage() throws {
+        for cachedTokens: Int? in [768, 0, nil] {
+            var usage: [String: Any] = ["input_tokens": 1000, "output_tokens": 20]
+            if let cachedTokens {
+                usage["input_tokens_details"] = ["cached_tokens": cachedTokens]
+            }
+            let event: [String: Any] = [
+                "type": "response.completed",
+                "response": [
+                    "status": "completed",
+                    "output": [["type": "message", "content": [["type": "output_text", "text": "Hello"]]]],
+                    "usage": usage,
+                ],
+            ]
+            var stream = MLXResponseStream()
+            _ = try stream.consume(String(decoding: JSONSerialization.data(withJSONObject: event), as: UTF8.self))
+            let result = try stream.result(elapsed: 1)
+            XCTAssertEqual(result.completion.usage?.cachedTokens, cachedTokens)
+            XCTAssertEqual(ChatResponseMetrics(completion: result.completion).cachedTokens, cachedTokens)
+            XCTAssertEqual(ChatResponseMetrics(completion: result.completion).promptTokens, 1000)
+        }
+    }
+
+    func testRecoveryNotesTravelSeparatelyOnBothRoutes() throws {
+        var chat = request([.init(role: "user", content: "Research")])
+        chat.toolResultContext = .init(entries: [.init(toolCallID: "page-1", text: "Exact source excerpt")], maxBytes: 4096)
+        let state = try ChatCompactionState(item: capsule, request: chat, serverURL: server)
+        let input = try state.input(for: chat, serverURL: server)
+        let wire = try NativResponsesClient(baseURL: server, tenant: "notes-test").makeResponseRequest(chat, input: input, compactThreshold: 6144)
+        let body = try MLXJSONValue(jsonData: XCTUnwrap(wire.httpBody))
+        let direct = try MLXJSONValue(jsonData: JSONEncoder().encode(chat))
+        XCTAssertEqual(body["tool_result_context"], direct["tool_result_context"])
+        XCTAssertEqual(body["tool_result_context"]?["entries"]?.arrayValue?.first?["tool_call_id"], .string("page-1"))
+        XCTAssertNil(body["transient_context"])
+        XCTAssertEqual(body["input"], .array([capsule]))
+        chat.toolResultContext = nil
+        XCTAssertEqual(try state.input(for: chat, serverURL: server), [capsule])
+    }
+
+    func testClosingGuidanceFollowsEvidenceOnBothRoutesWithoutInvalidatingCompaction() throws {
+        var chat = request([.init(role: "user", content: "Research five sources")])
+        let state = try ChatCompactionState(item: capsule, request: chat, serverURL: server)
+        chat.transientContext = "Collected evidence"
+        chat.completionInstruction = ChatToolRoundGate.finalAnswerPrompt
+        let input = try state.input(for: chat, serverURL: server)
+        XCTAssertEqual(input, [capsule])
+        let responses = NativResponsesClient(baseURL: server, tenant: "closing-guidance-test")
+        let wire = try responses.makeResponseRequest(chat, input: input, compactThreshold: 6144)
+        let body = try MLXJSONValue(jsonData: XCTUnwrap(wire.httpBody))
+        let sent = try XCTUnwrap(body["input"]?.arrayValue)
+        XCTAssertEqual(sent, [capsule])
+        XCTAssertEqual(body["transient_context"], .string("Collected evidence\n\n" + ChatToolRoundGate.finalAnswerPrompt))
+        let client = NativChatClient(baseURL: server)
+        let chatBody = try MLXJSONValue(jsonData: JSONEncoder().encode(chat))
+        XCTAssertEqual(chatBody["messages"]?.arrayValue?.count, 1)
+        XCTAssertEqual(chatBody["transient_context"], body["transient_context"])
+        XCTAssertNil(chatBody["completionInstruction"])
+        let countWire = try client.makePromptTokenCountURLRequest(for: chat)
+        XCTAssertEqual(try MLXJSONValue(jsonData: XCTUnwrap(countWire.httpBody))["input"], chatBody["messages"])
+        // Closing guidance is neither persisted nor carried into a new user request.
+        let next = try ChatCompactionState(item: capsule, request: chat, serverURL: server)
+        chat.completionInstruction = nil
+        chat.transientContext = nil
+        XCTAssertEqual(try next.input(for: chat, serverURL: server), [capsule])
+        XCTAssertTrue(chat.contextMessages.isEmpty)
+    }
+
     @MainActor
     func testUnknownToolCleanupInvalidatesCompactedFailureHistory() throws {
         let call = MLXChatToolCall(id: "bad-call", function: .init(name: "mcp__update", arguments: "{}"))
@@ -178,8 +298,42 @@ final class ChatCompactionTests: XCTestCase {
         XCTAssertEqual(result.completion.finishReason, "tool_calls")
         XCTAssertEqual(result.completion.usage?.promptTokens, 1000)
         XCTAssertEqual(result.completion.usage?.completionTokens, 20)
+        XCTAssertNil(result.completion.usage?.promptTokensPerSecond)
+        XCTAssertNil(result.completion.usage?.peakMemoryGB)
+        XCTAssertEqual(result.completion.usage?.decodeTokensPerSecond, 42)
         let measured = try stream.result(elapsed: 1, inputTokensBeforeCompaction: 8000)
         XCTAssertEqual(measured.inputTokensBeforeCompaction, 8000)
+    }
+
+    func testResponseTimingsReachChatMetricsForCompletedAndIncompleteStreams() throws {
+        for status in ["completed", "incomplete"] {
+            var stream = MLXResponseStream()
+            _ = try stream.consume(#"{"type":"response.output_text.delta","delta":"Hello","timings":{"predicted_per_second":30}}"#)
+            let done = MLXJSONValue.object([
+                "type": .string("response.\(status)"),
+                "timings": .object([
+                    "prompt_per_second": .number(1234.5),
+                    "predicted_per_second": .number(42),
+                    "peak_memory": .number(8.5),
+                ]),
+                "response": .object([
+                    "status": .string(status),
+                    "output": .array([.object([
+                        "type": .string("message"),
+                        "content": .array([.object(["type": .string("output_text"), "text": .string("Hello")])]),
+                    ])]),
+                    "usage": .object(["input_tokens": .number(1000), "output_tokens": .number(20), "total_tokens": .number(1020)]),
+                ]),
+            ])
+            _ = try stream.consume(String(decoding: JSONEncoder().encode(done), as: UTF8.self))
+            let completion = try stream.result(elapsed: 1).completion
+            let metrics = ChatResponseMetrics(completion: completion)
+            XCTAssertEqual(metrics.prefillTokensPerSecond, 1234.5)
+            XCTAssertEqual(metrics.decodeTokensPerSecond, 42)
+            XCTAssertEqual(metrics.peakMemoryGB, 8.5)
+            XCTAssertEqual(metrics.totalTokens, 1020)
+            XCTAssertEqual(completion.finishReason, status == "incomplete" ? "length" : "stop")
+        }
     }
 
     func testFailedOrUnfinishedStreamCannotCommitCompaction() throws {
@@ -283,21 +437,22 @@ final class ChatCompactionTests: XCTestCase {
             let body = try MLXJSONValue(jsonData: XCTUnwrap(wire.httpBody))
             let sent = try XCTUnwrap(body["input"]?.arrayValue)
             XCTAssertEqual(body["instructions"], .string(try XCTUnwrap(chat.messages[0].textContent)))
-            XCTAssertEqual(Array(sent.dropLast()), input)
-            XCTAssertEqual(sent.last?["content"], .string(try XCTUnwrap(chat.transientContext)))
-            XCTAssertEqual(sent[sent.count - 2]["tool_call_id"], .string(try XCTUnwrap(call.id)))
+            XCTAssertEqual(sent, input)
+            XCTAssertEqual(body["transient_context"], .string(try XCTUnwrap(chat.transientContext)))
+            XCTAssertEqual(sent.last?["tool_call_id"], .string(try XCTUnwrap(call.id)))
             XCTAssertEqual(body["tools"]?.arrayValue?.first?["function"]?["description"], .string("Read release notes"))
             let chatClient = NativChatClient(baseURL: server)
             let chatWire = try chatClient.makeURLRequest(payload: chat, accepts: "application/json")
             let chatBody = try MLXJSONValue(jsonData: XCTUnwrap(chatWire.httpBody))
             let sentMessages = try XCTUnwrap(chatBody["messages"]?.arrayValue)
-            XCTAssertEqual(sentMessages.count, chat.messages.count + 1)
-            XCTAssertEqual(sentMessages.last?["content"], sent.last?["content"])
-            XCTAssertEqual(sentMessages[sentMessages.count - 2]["tool_call_id"], .string(try XCTUnwrap(call.id)))
+            XCTAssertEqual(sentMessages.count, chat.messages.count)
+            XCTAssertEqual(chatBody["transient_context"], body["transient_context"])
+            XCTAssertEqual(sentMessages.last?["tool_call_id"], .string(try XCTUnwrap(call.id)))
             XCTAssertNil(chatBody["transientContext"])
             let countWire = try chatClient.makePromptTokenCountURLRequest(for: chat)
             let countBody = try MLXJSONValue(jsonData: XCTUnwrap(countWire.httpBody))
             XCTAssertEqual(countBody["input"], chatBody["messages"])
+            XCTAssertEqual(countBody["transient_context"], body["transient_context"])
             previousInput = input
         }
         // A new capsule fingerprints only the transcript, even when its request included a snapshot.
@@ -313,7 +468,7 @@ final class ChatCompactionTests: XCTestCase {
         let chat = request([.init(role: "system", content: "Current tools"), .init(role: "user", content: "Continue")])
         let state = try ChatCompactionState(item: capsule, request: chat, serverURL: server)
         var encoded = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(state)) as? [String: Any])
-        encoded.removeValue(forKey: "formatVersion")
+        encoded["formatVersion"] = 1
         let legacy = try JSONDecoder().decode(ChatCompactionState.self, from: JSONSerialization.data(withJSONObject: encoded))
         let input = try legacy.input(for: chat, serverURL: server)
         XCTAssertEqual(input, try NativResponsesClient.inputItems(chat.messages))
@@ -421,6 +576,9 @@ final class ChatCompactionTests: XCTestCase {
             onEvent: { _ in }
         )
         XCTAssertEqual(response.completion.content, "Hello")
+        let metrics = ChatResponseMetrics(completion: response.completion)
+        XCTAssertEqual(metrics.prefillTokensPerSecond, 1234.5)
+        XCTAssertEqual(metrics.peakMemoryGB, 8.5)
         XCTAssertNotNil(response.compaction)
         XCTAssertEqual(response.inputTokensBeforeCompaction, 25000)
         let recorded = await progress.tokens
@@ -586,7 +744,7 @@ private final class CompactionURLProtocol: URLProtocol {
             data: {"type":"response.output_text.delta","delta":"Hello"}
 
             event: response.completed
-            data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"compaction","encrypted_content":"opaque"},{"type":"message","content":[{"type":"output_text","text":"Hello"}]}]}}
+            data: {"type":"response.completed","timings":{"prompt_per_second":1234.5,"predicted_per_second":42,"peak_memory":8.5},"response":{"status":"completed","usage":{"input_tokens":1000,"output_tokens":20,"total_tokens":1020},"output":[{"type":"compaction","encrypted_content":"opaque"},{"type":"message","content":[{"type":"output_text","text":"Hello"}]}]}}
 
 
             """
@@ -618,11 +776,12 @@ private final class CompactedBudgetURLProtocol: URLProtocol {
                     data.append(contentsOf: buffer.prefix(count))
                 }
             }
-            let input = try XCTUnwrap(MLXJSONValue(jsonData: data)["input"]?.arrayValue)
-            XCTAssertEqual(input.count, 3)
+            let body = try MLXJSONValue(jsonData: data)
+            let input = try XCTUnwrap(body["input"]?.arrayValue)
+            XCTAssertEqual(input.count, 2)
             XCTAssertEqual(input.first?["type"], .string("compaction"))
             XCTAssertEqual(input[1]["content"], .string("Continue"))
-            XCTAssertEqual(input.last?["content"], .string("Fresh PDF excerpts"))
+            XCTAssertEqual(body["transient_context"], .string("Fresh PDF excerpts"))
             let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: Data(#"{"input_tokens":200}"#.utf8))

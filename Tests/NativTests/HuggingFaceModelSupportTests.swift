@@ -2,21 +2,37 @@ import NativServerKit
 import XCTest
 
 final class HuggingFaceModelSupportTests: XCTestCase {
-    func testNativeDecisionLoadersAndD1ConfigurationAreSupported() throws {
-        let classifier = try makeClassifier()
-        for payload: [String: Any] in [
-            ["model_type": "laya"],
-            ["model_type": "lfm2_vl", "auto_map": ["AutoModel": "modeling_d1.D1Model", "AutoTokenizer": ["CustomTokenizer", NSNull()]]],
-        ] {
+    func testBundledDiarizationModelIsSupported() throws {
+        // Matches the Hub metadata that previously produced an Unsupported badge.
+        let payload: [String: Any] = [
+            "id": "nativ-community/Nemotron-3-Diarization",
+            "pipeline_tag": "voice-activity-detection",
+            "tags": ["mlx-audio", "speaker-diarization", "streaming-sortformer"],
+            "config": ["model_type": "nemotron_diarization", "processor_config": [:]],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        let model = try JSONDecoder().decode(HuggingFaceModel.self, from: data)
+
+        XCTAssertEqual(model.support, .supported)
+        XCTAssertEqual(model.provider, .nvidia)
+    }
+
+    func testBundledVADLoadersAndAliasesAreSupported() throws {
+        let registry = try Nativ.modelTypeRegistry()
+        let classifier = HuggingFaceModelSupportClassifier(registry: registry)
+        for modelType in ["nemotron_diarization", "sortformer", "silero_vad", "silero", "silero-vad"] {
+            XCTAssertEqual(registry.capabilities(for: modelType), [.voiceActivityDetection])
             XCTAssertEqual(classifier.classify(
-                configuration: try configuration(payload), pipelineTag: "text-classification", tags: []
-            ), .supported)
+                configuration: try configuration(modelType: modelType),
+                pipelineTag: "voice-activity-detection",
+                tags: []
+            ), .supported, modelType)
         }
         XCTAssertEqual(classifier.classify(
-            configuration: try configuration([
-                "model_type": "lfm2_vl", "auto_map": ["AutoModel": "other.CustomModel"],
-            ]), pipelineTag: "image-text-to-text", tags: []
-        ), .unknown)
+            configuration: try configuration(modelType: "unrecognized-diarization"),
+            pipelineTag: "voice-activity-detection",
+            tags: ["speaker-diarization"]
+        ), .unsupported)
     }
 
     func testCanonicalAndAliasModelTypesAreSupported() throws {
@@ -337,9 +353,6 @@ final class HuggingFaceModelSupportTests: XCTestCase {
                 "aliases": [:],
             ]
         }
-        capabilities[NativModelCapability.decision.rawValue] = [
-            "model_types": ["laya", "d1"], "aliases": [:],
-        ]
         capabilities[NativModelCapability.language.rawValue] = [
             "model_types": ["language-loader"],
             "aliases": ["language-alias": "language-loader"],
@@ -353,7 +366,6 @@ final class HuggingFaceModelSupportTests: XCTestCase {
             "schema_version": 1,
             "package_versions": ["mlx-vlm": "test", "mlx-audio": "test"],
             "capabilities": capabilities,
-            "configuration_aliases": [["model_type": "lfm2_vl", "auto_model_suffix": "D1Model", "loader": "d1"]],
         ])
         let registry = try NativModelTypeRegistry(data: data)
         return HuggingFaceModelSupportClassifier(registry: registry)

@@ -36,6 +36,7 @@ struct ChatSession: Identifiable, Equatable, Codable {
     var personalizationSnapshot: String? = nil
     var worktree: ChatGitWorktree? = nil
     var workFilesInWorktree: Bool? = nil
+    var accessMode: ChatAccessMode? = nil
 
     mutating func capturePersonalization(_ personalization: NativPersonalization) {
         guard personalizationSnapshot == nil else { return }
@@ -438,14 +439,31 @@ struct ChatTranscriptMessage: Identifiable, Equatable, Codable, Sendable {
 
 struct ChatResponseMetrics: Equatable, Codable {
     let totalTokens: Int?
+    let promptTokens: Int?
+    let cachedTokens: Int?
     let generatedTokens: Int?
     let decodeTokensPerSecond: Double?
     let prefillTokensPerSecond: Double?
     let peakMemoryGB: Double?
     let specAcceptanceRate: Double?
 
+    var uncachedPromptTokens: Int? {
+        guard let promptTokens, let cachedTokens,
+              promptTokens >= 0, cachedTokens >= 0, cachedTokens <= promptTokens else {
+            return nil
+        }
+        return promptTokens - cachedTokens
+    }
+
+    var cacheReuseFraction: Double? {
+        guard let promptTokens, promptTokens > 0, let cachedTokens,
+              uncachedPromptTokens != nil else { return nil }
+        return Double(cachedTokens) / Double(promptTokens)
+    }
+
     var hasVisibleValues: Bool {
         totalTokens != nil
+            || cachedTokens != nil
             || generatedTokens != nil
             || decodeTokensPerSecond != nil
             || prefillTokensPerSecond != nil
@@ -459,9 +477,13 @@ struct ChatResponseMetrics: Equatable, Codable {
         decodeTokensPerSecond: Double? = nil,
         prefillTokensPerSecond: Double? = nil,
         peakMemoryGB: Double? = nil,
-        specAcceptanceRate: Double? = nil
+        specAcceptanceRate: Double? = nil,
+        cachedTokens: Int? = nil,
+        promptTokens: Int? = nil
     ) {
         self.totalTokens = totalTokens
+        self.promptTokens = promptTokens
+        self.cachedTokens = cachedTokens
         self.generatedTokens = generatedTokens
         self.decodeTokensPerSecond = decodeTokensPerSecond
         self.prefillTokensPerSecond = prefillTokensPerSecond
@@ -476,7 +498,9 @@ struct ChatResponseMetrics: Equatable, Codable {
             decodeTokensPerSecond: completion.resolvedDecodeTokensPerSecond,
             prefillTokensPerSecond: completion.usage?.promptTokensPerSecond,
             peakMemoryGB: completion.usage?.peakMemoryGB,
-            specAcceptanceRate: completion.usage?.specAcceptanceRate
+            specAcceptanceRate: completion.usage?.specAcceptanceRate,
+            cachedTokens: completion.usage?.cachedTokens,
+            promptTokens: completion.usage?.promptTokens
         )
     }
 }
@@ -927,6 +951,10 @@ struct ChatSessionStore {
                 files.removeRenamedFiles(previous: previous, current: state, sessionID: persisted.id)
             }
             mediaStore.updateOwner("chat:\(persisted.id.uuidString)", assets: persisted.assetReferences)
+            if let stamp = ArtifactFileIndexer.stamp(sessionURL(for: persisted.id)) {
+                NotificationCenter.default.post(name: ArtifactFileManifest.changed,
+                    object: ArtifactFileManifest(root: chatDirectory, session: persisted, stamp: stamp))
+            }
             return true
         } catch {
             reportFailure("saveSession", sessionID: session.id, error: error)

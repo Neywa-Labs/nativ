@@ -13,6 +13,7 @@ struct ChatToolExecutionContext: Sendable {
     let imageReferences: [ChatImageAttachment]
     let modelSearchPath: String
     let additionalModelSearchPaths: [String]
+    var browsingMaximumResultBytes = ChatBrowsingBudget.maximumBytes(context: 8192)
     var huggingFaceToken: String? = nil
     var analyticsDatabaseURL: URL? = nil
     var imageToolDependencies = ChatImageToolDependencies.live
@@ -52,6 +53,12 @@ struct ChatToolExecutionOutcome: Sendable {
 
 enum ChatToolRoundGate {
     static let maximumRounds = 32
+    static let finalAnswerPrompt = """
+        The tool round limit for this request has been reached. Tools are no longer available. \
+        Write your final answer to the user's original request using the evidence already collected. \
+        Do not emit or attempt further tool calls. Clearly state any requested work or source reads \
+        that remain incomplete; do not claim that missing work was done.
+        """
 
     static func advertisesTools(atRound round: Int) -> Bool {
         round < maximumRounds
@@ -522,18 +529,18 @@ enum ChatToolDispatcher {
 
     private static func executeWebSearchTool(
         call: MLXChatToolCall,
-        context _: ChatToolExecutionContext
+        context: ChatToolExecutionContext
     ) async throws -> ChatToolExecutionOutcome {
         let content = try await ChatWebSearchToolExecutor().execute(call: call)
-        return ChatToolExecutionOutcome(content: content, attachments: [])
+        return ChatToolExecutionOutcome(content: ChatBrowsingBudget.bound(content, maximumBytes: context.browsingMaximumResultBytes), attachments: [])
     }
 
     private static func executeWebReadTool(
         call: MLXChatToolCall,
-        context _: ChatToolExecutionContext
+        context: ChatToolExecutionContext
     ) async throws -> ChatToolExecutionOutcome {
         let content = try await ChatWebReadToolExecutor().execute(call: call)
-        return ChatToolExecutionOutcome(content: content, attachments: [])
+        return ChatToolExecutionOutcome(content: ChatBrowsingBudget.bound(content, maximumBytes: context.browsingMaximumResultBytes), attachments: [])
     }
 
     private static func executeReadFileTool(
@@ -592,7 +599,10 @@ enum ChatToolDispatcher {
         let request = try ChatWorkRequest.decode(call)
         try Task.checkCancellation()
         let content = try await action(request)
-        return ChatToolExecutionOutcome(content: content, attachments: [])
+        let bounded = request.action.isBrowserAction || (request.action == .open && (request.url != nil || request.elementID != nil))
+            ? ChatBrowsingBudget.bound(content, maximumBytes: context.browsingMaximumResultBytes,
+                                       prioritizeText: [.open, .navigate, .search, .back, .forward].contains(request.action)) : content
+        return ChatToolExecutionOutcome(content: bounded, attachments: [])
     }
 
     private static func failurePayloadForImageTool(name: String, error: Error) -> String {
@@ -623,6 +633,17 @@ final class ChatToolConsentGate {
 
     var pendingSessions: [UUID: UUID] {
         sessions.filter { pending[$0.key] != nil }
+    }
+
+    func authorize(
+        _ operation: ChatToolOperation, mode: ChatAccessMode, id: UUID, sessionID: UUID,
+        onAwaiting: () -> Void
+    ) async -> ChatToolConsentOutcome {
+        guard !Task.isCancelled else { return .cancelled }
+        guard mode.requiresApproval(for: operation) else { return .approved }
+        onAwaiting()
+        let approved = await awaitDecision(for: id, inSession: sessionID)
+        return ChatToolConsentRouter.outcome(approved: approved, isCancelled: Task.isCancelled)
     }
 
     func confirm(_ id: UUID) {
@@ -656,6 +677,70 @@ final class ChatToolConsentGate {
             Task { @MainActor in
                 denyRequest()
             }
+        }
+    }
+}
+
+/// Access modes change consent only; executor safety checks remain mandatory.
+enum ChatAccessMode: String, Codable, CaseIterable, Identifiable, Sendable {
+    case standard
+    case medium
+    case fullAccess
+
+    var id: Self { self }
+    var title: String {
+        switch self {
+        case .standard: "Standard"
+        case .medium: "Medium"
+        case .fullAccess: "Full access"
+        }
+    }
+
+    func requiresApproval(for operation: ChatToolOperation) -> Bool {
+        switch operation {
+        case .routine: false
+        case .workPane: self == .standard
+        case .sensitive: self != .fullAccess
+        case .command: true
+        case .external: false
+        }
+    }
+
+}
+
+/// Classifies effects independently of the selected approval mode.
+enum ChatToolOperation: CaseIterable, Sendable {
+    case routine, workPane, sensitive, command, external
+
+    static func classify(
+        toolName: String?, customKind: CustomToolKind?, workAction: ChatWorkRequest.Action?,
+        isMCP: Bool, usesNativeFilesystem: Bool, protectedWrite: Bool
+    ) -> Self {
+        if let customKind {
+            switch customKind {
+            case .script: return .command
+            case .endpoint: return .external
+            }
+        }
+        if isMCP {
+            return usesNativeFilesystem ? (protectedWrite ? .sensitive : .routine) : .external
+        }
+        if toolName == ChatTerminalToolRegistry.toolName { return .command }
+        if toolName == ChatWorkToolRegistry.toolName {
+            guard let workAction else { return .sensitive }
+            return work(workAction)
+        }
+        if protectedWrite || toolName == ChatSwitchModelToolRegistry.toolName { return .sensitive }
+        return .routine
+    }
+
+    static func work(_ action: ChatWorkRequest.Action) -> Self {
+        // Exhaustive so every new work action requires an explicit policy decision.
+        switch action {
+        case .run: .command
+        case .click, .type, .upload: .sensitive
+        case .list, .attachments, .read, .create, .update, .open, .search, .inspect,
+             .navigate, .back, .forward, .reload, .interrupt: .workPane
         }
     }
 }

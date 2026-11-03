@@ -101,8 +101,10 @@ final class NativModel: ChatModelSwitchingSurface {
     var settings = NativSettings.load() {
         didSet {
             settings.save()
+            runtimeSettings.setDesired(settings.runtimeSettings)
         }
     }
+    let runtimeSettings = NativRuntimeSettingsController()
 
     var menuIsOpen = false
     var onMenuStateChanged: (() -> Void)?
@@ -395,35 +397,33 @@ final class NativModel: ChatModelSwitchingSurface {
         return settingsAppliedAtServerStart.serverBaseURL
     }
 
-    func predictDecision(modelID: String, state: MLXJSONValue,
-                         question: NativDecisionQuestion) async throws -> NativDecisionResponse {
-        guard isRunning, let activeSettings = settingsAppliedAtServerStart, !isModelLoading, !inferenceActivityInProgress else {
-            throw NativDecisionError.httpStatus(409, "Start the server and wait for active inference or model loading to finish.")
-        }
-        let operationID = UUID()
-        guard inferenceActivity?.begin(resource: .decision, windowID: operationID, operationID: operationID) != false else {
-            throw NativDecisionError.httpStatus(409, "Another decision request is already running.")
-        }
-        defer { inferenceActivity?.end(resource: .decision, operationID: operationID) }
-        let operation = Task {
-            do {
-                return try await NativDecisionClient(baseURL: activeSettings.serverBaseURL, apiKey: activeSettings.serverAPIKey, timeout: 120)
-                    .predict(model: modelID, state: state, questions: ["answer": question])
-            } catch {
-                if error is URLError {
-                    let client = NativMetricsClient(baseURL: activeSettings.serverBaseURL)
-                    while server.isRunning && settingsAppliedAtServerStart == activeSettings {
-                        if let snapshot = try? await client.fetchMetrics(apiKey: activeSettings.serverAPIKey),
-                           snapshot.summary.inFlight == 0 { break }
-                        try? await Task.sleep(for: .seconds(1))
-                    }
-                }
-                throw error
-            }
-        }
-        let result = try await operation.value
+    /// Called only by an explicit processing action or a newly completed meeting.
+    /// Readiness is checked separately from process launch, including with native ASR.
+    func prepareAudioAnalysisServer() async throws -> NativAudioClient {
         try Task.checkCancellation()
-        return result
+        if !isRunning { startServer() }
+        guard isRunning, let launched = settingsAppliedAtServerStart else {
+            throw NativAudioAnalysisError.serverNotRunning
+        }
+        let client = NativAudioClient(baseURL: launched.serverBaseURL, apiKey: launched.serverAPIKey, timeout: 7_200)
+        let deadline = Date().addingTimeInterval(120)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        while Date() < deadline {
+            try Task.checkCancellation()
+            guard isRunning else { throw NativAudioAnalysisError.serverNotRunning }
+            var request = URLRequest(url: launched.serverBaseURL.appendingPathComponent("health"))
+            request.timeoutInterval = 2
+            if let key = launched.serverAPIKey, !key.isEmpty {
+                request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            }
+            if let (_, response) = try? await session.data(for: request),
+               let response = response as? HTTPURLResponse, response.statusCode == 200 {
+                return client
+            }
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        throw NativAudioAnalysisError.serverNotRunning
     }
 
     func startServer() {
@@ -439,7 +439,9 @@ final class NativModel: ChatModelSwitchingSurface {
         modelLoadingProgress = settings.normalized().languageModelID == nil ? nil : 0
         var launchArguments = settings.launchArguments
         if let languageModelID = settings.normalized().languageModelID,
-           isKnownNonGenerativeModel(languageModelID),
+           LocalModelDiscovery.isKnownNonLanguageModel(
+               repoID: languageModelID, searchPaths: settings.normalized().modelSearchRoots
+           ),
            let modelFlagIndex = launchArguments.firstIndex(of: "--model"),
            modelFlagIndex + 1 < launchArguments.count {
             // A stale, non-chat selection (e.g. a BERT encoder) would make the
@@ -505,50 +507,15 @@ final class NativModel: ChatModelSwitchingSurface {
         }
 
         if shouldStartMetrics {
+            if let launched = settingsAppliedAtServerStart {
+                let client = NativRuntimeSettingsClient(baseURL: launched.serverBaseURL, apiKey: launched.serverAPIKey)
+                runtimeSettings.start(applied: launched.runtimeSettings) { values in
+                    try await client.update(values)
+                }
+            }
             startMetricsPolling()
         }
         notifyMenuStateChanged()
-    }
-
-    /// Returns true only when the model is present locally and its config's
-    /// architectures are all non-generative (e.g. a BERT/RoBERTa encoder), which
-    /// mlx-vlm cannot load as a chat model. Any uncertainty returns false, so a
-    /// genuine chat model is never skipped.
-    private func isKnownNonGenerativeModel(_ repoID: String) -> Bool {
-        let cacheName = "models--" + repoID.replacingOccurrences(of: "/", with: "--")
-        let fileManager = FileManager.default
-
-        // Consolidated roots (primary folder + user-added folders + HF hub cache) so
-        // this check also covers models the user keeps in custom folders.
-        let roots = settings.normalized().modelSearchRoots
-
-        let generativeMarkers = ["forcausallm", "forconditionalgeneration", "lmheadmodel"]
-        for root in roots {
-            let snapshots = URL(fileURLWithPath: root)
-                .appendingPathComponent(cacheName)
-                .appendingPathComponent("snapshots")
-            guard let revisions = try? fileManager.contentsOfDirectory(
-                at: snapshots,
-                includingPropertiesForKeys: nil
-            ) else {
-                continue
-            }
-            for revision in revisions {
-                let configURL = revision.appendingPathComponent("config.json")
-                guard let data = try? Data(contentsOf: configURL),
-                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let architectures = json["architectures"] as? [String],
-                      !architectures.isEmpty
-                else {
-                    continue
-                }
-                let isGenerative = architectures
-                    .map { $0.lowercased() }
-                    .contains { arch in generativeMarkers.contains { arch.contains($0) } }
-                return !isGenerative
-            }
-        }
-        return false
     }
 
     func stopServer(preserveSessionStats: Bool = false) {
@@ -755,7 +722,6 @@ final class NativModel: ChatModelSwitchingSurface {
             == normalizedModelID
             && server.isRunning
             && !settingsRequireRestart
-            && (slot != .decision || normalizedModelID == metrics?.server.loadedDecisionModel)
         guard !selectionIsAlreadyApplied else {
             return
         }
@@ -852,20 +818,7 @@ final class NativModel: ChatModelSwitchingSurface {
     }
 
     func resetSettings() {
-        guard settings.externalModelCache != nil else {
-            settings = NativSettings()
-            return
-        }
-
-        do {
-            try ensureModelCacheCanChange()
-            try switchModelCache(
-                to: NativSettings(modelSearchPath: systemModelCachePath),
-                state: .systemDefault
-            )
-        } catch {
-            appendLog("\nCouldn’t reset settings: \(error.localizedDescription)\n")
-        }
+        settings.resetModelConfiguration()
     }
 
     func selectExternalModelCache(at selectedURL: URL) throws {
@@ -1257,6 +1210,7 @@ final class NativModel: ChatModelSwitchingSurface {
     }
 
     private func stopMetricsPolling(clearSession: Bool) {
+        runtimeSettings.stop()
         prefillCompletionTask?.cancel()
         prefillCompletionTask = nil
         prefillProgress.apply(.reset)
@@ -1295,15 +1249,11 @@ final class NativModel: ChatModelSwitchingSurface {
         metricsStartupGraceUntil = nil
         metricsLoading = false
         modelLoadingProgress = nil
+        runtimeSettings.serverBecameReady()
         recordSessionActivity(
             promptTokenCount: fetchedMetrics.summary.promptTokensTotal,
             generatedTokenCount: fetchedMetrics.summary.generatedTokensTotal
         )
-        if fetchedMetrics.server.loadedDecisionModel == nil,
-           let message = fetchedMetrics.server.decisionModelLoadError,
-           message != metrics?.server.decisionModelLoadError {
-            setModelLoadFailure(modelID: settings.decisionModelID, message: message)
-        }
         metrics = fetchedMetrics
         modelSwitchInProgress = false
         modelSwitchTargetID = nil

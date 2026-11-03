@@ -849,6 +849,8 @@ def iter_message_media(messages: list[Any]) -> tuple[int, int]:
 
 def resolve_thinking_enabled(payload: dict[str, Any]) -> bool:
     value = payload.get("enable_thinking")
+    if value is None and isinstance(payload.get("chat_template_kwargs"), dict):
+        value = payload["chat_template_kwargs"].get("enable_thinking")
     if isinstance(value, bool):
         return value
     return bool(base.get_server_enable_thinking())
@@ -869,14 +871,20 @@ _PER_MODEL_CONFIGS = _load_per_model_configs()
 
 
 def apply_per_model_request_defaults(payload: dict[str, Any]) -> bool:
+    changed = False
+    options = payload.get("chat_template_kwargs")
+    if payload.get("enable_thinking") is None and isinstance(options, dict):
+        alias = options.get("enable_thinking")
+        if isinstance(alias, bool):
+            payload["enable_thinking"] = alias
+            changed = True
     model_id = payload.get("model")
     if not isinstance(model_id, str):
-        return False
+        return changed
     profile = _PER_MODEL_CONFIGS.get(model_id)
     if not isinstance(profile, dict):
-        return False
+        return changed
 
-    changed = False
     thinking_enabled = profile.get("thinkingEnabled")
     if "enable_thinking" not in payload and isinstance(thinking_enabled, bool):
         payload["enable_thinking"] = thinking_enabled
@@ -1264,6 +1272,50 @@ async def materialize_response(response: Any) -> tuple[Any, bytes]:
     return rebuilt, response_body
 
 
+def install_runtime_settings_overlay() -> None:
+    """Keep legacy environment fallbacks in sync with accepted live settings.
+
+    The engine still consults startup environment variables for nullable KV
+    and drafter settings. Clearing an override must also clear that fallback.
+    Wrap the class because the CLI replaces runtime.config after parsing flags.
+    """
+    from mlx_vlm.server.runtime_config import RuntimeConfig
+
+    if getattr(RuntimeConfig, "_nativ_live_settings_installed", False):
+        return
+    original = RuntimeConfig.apply_changes
+    environment_names = {
+        "kv_bits": "KV_BITS",
+        "kv_quant_scheme": "KV_QUANT_SCHEME",
+        "kv_group_size": "KV_GROUP_SIZE",
+        "quantized_kv_start": "QUANTIZED_KV_START",
+        "max_kv_size": "MAX_KV_SIZE",
+        "draft_model": "MLX_VLM_DRAFT_MODEL",
+        "draft_kind": "MLX_VLM_DRAFT_KIND",
+        "spec_draft_model": "MLX_VLM_DRAFT_MODEL",
+        "spec_draft_kind": "MLX_VLM_DRAFT_KIND",
+        "apc_enabled": "APC_ENABLED",
+        "apc_num_blocks": "APC_NUM_BLOCKS",
+        "apc_block_size": "APC_BLOCK_SIZE",
+    }
+
+    def apply_changes(self, payload, op="merge"):
+        applied, rejected = original(self, payload, op=op)
+        values = self.current() if op == "replace" else applied
+        for name, value in values.items():
+            variable = environment_names.get(name)
+            if variable is None:
+                continue
+            if value is None:
+                os.environ.pop(variable, None)
+            else:
+                os.environ[variable] = str(int(value)) if isinstance(value, bool) else str(value)
+        return applied, rejected
+
+    RuntimeConfig.apply_changes = apply_changes
+    RuntimeConfig._nativ_live_settings_installed = True
+
+
 def install_metrics_overlay() -> None:
     if getattr(base.app.state, "mlx_platform_metrics_installed", False):
         return
@@ -1464,6 +1516,7 @@ def main() -> None:
 
 
 install_model_load_progress()
+install_runtime_settings_overlay()
 install_metrics_overlay()
 
 
