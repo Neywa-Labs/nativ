@@ -35,6 +35,8 @@ struct MarkdownBlock {
     var text: [MarkdownTextFragment]
     var decorations: [MarkdownDecoration] = []
     var scrollsHorizontally = false
+    /// Raw source for fenced code blocks; when set, the block shows a copy button.
+    var copyText: String?
 }
 
 struct MarkdownLayout {
@@ -180,6 +182,9 @@ enum MarkdownLayouter {
                 addText(
                     output, x: x, width: width, id: id, horizontal: true, padding: 16,
                     background: style.background)
+                if !code.isEmpty, let last = blocks.indices.last, blocks[last].id == id {
+                    blocks[last].copyText = code
+                }
             case "heading":
                 let scales: [CGFloat] = [2, 1.5, 1.25, 1, 0.875, 0.85]
                 let size = style.fontSize * scales[min(5, max(0, node.level - 1))]

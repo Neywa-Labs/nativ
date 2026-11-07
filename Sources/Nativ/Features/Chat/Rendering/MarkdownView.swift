@@ -262,6 +262,14 @@ final class MarkdownSurface: NSView {
 
 @MainActor
 private final class MarkdownHorizontalScrollView: NSScrollView {
+    // Overlay scrollers stay hidden until a trackpad swipe, so mouse-wheel users never
+    // learn the block is clipped and cannot reach the end of a long command. Pin the
+    // always-visible legacy style even when the system preference flips back to overlay.
+    override var scrollerStyle: NSScroller.Style {
+        get { .legacy }
+        set { super.scrollerStyle = .legacy }
+    }
+
     override func scrollWheel(with event: NSEvent) {
         if abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX) {
             nextResponder?.scrollWheel(with: event)
@@ -275,6 +283,7 @@ private final class MarkdownHorizontalScrollView: NSScrollView {
 private final class MarkdownBlockView: NSView {
     let content = MarkdownBlockContentView()
     private var scroller: NSScrollView?
+    private var copyButton: MarkdownCopyButton?
     override var isFlipped: Bool { true }
     var containsSelection: Bool { content.containsSelection }
 
@@ -293,10 +302,12 @@ private final class MarkdownBlockView: NSView {
                 scroll.drawsBackground = false
                 scroll.hasHorizontalScroller = true
                 scroll.hasVerticalScroller = false
-                scroll.scrollerStyle = .overlay
+                scroll.scrollerStyle = .legacy
+                // The layout reserves 12pt under scrolling blocks; a small legacy scroller fits it.
+                scroll.horizontalScroller?.controlSize = .small
                 scroll.autohidesScrollers = true
                 scroll.documentView = content
-                addSubview(scroll)
+                addSubview(scroll, positioned: .below, relativeTo: copyButton)
                 scroller = scroll
             }
             scroller?.frame = bounds
@@ -306,11 +317,83 @@ private final class MarkdownBlockView: NSView {
                 scroller.documentView = nil
                 scroller.removeFromSuperview()
                 self.scroller = nil
-                addSubview(content)
+                addSubview(content, positioned: .below, relativeTo: copyButton)
             }
             content.frame = bounds
         }
         content.update(block, selection: selection, fadeStart: fadeStart, newBlockStart: newBlockStart)
+        updateCopyButton(for: block)
+    }
+
+    /// Kept outside the scroll view so it stays pinned to the visible top-right corner.
+    private func updateCopyButton(for block: MarkdownBlock) {
+        guard let text = block.copyText else {
+            copyButton?.removeFromSuperview()
+            copyButton = nil
+            return
+        }
+        let button = copyButton ?? MarkdownCopyButton()
+        if copyButton == nil {
+            addSubview(button)
+            copyButton = button
+        }
+        button.text = text
+        let side: CGFloat = 24
+        button.frame = CGRect(x: bounds.width - side - 6, y: 6, width: side, height: side)
+    }
+}
+
+@MainActor
+private final class MarkdownCopyButton: NSButton {
+    var text = ""
+    private var resetTask: Task<Void, Never>?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        isBordered = false
+        imagePosition = .imageOnly
+        contentTintColor = .secondaryLabelColor
+        wantsLayer = true
+        layer?.cornerRadius = 5
+        target = self
+        action = #selector(copyText)
+        showIcon(copied: false)
+        applyBackground()
+    }
+
+    required init?(coder: NSCoder) { fatalError("Not a serialized view") }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyBackground()
+    }
+
+    /// CGColor snapshots don't follow light/dark changes, so resolve it per appearance.
+    private func applyBackground() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor =
+                NSColor.controlBackgroundColor.withAlphaComponent(0.85).cgColor
+        }
+    }
+
+    private func showIcon(copied: Bool) {
+        let title = copied ? "Copied" : "Copy"
+        image = NSImage(
+            systemSymbolName: copied ? "checkmark" : "doc.on.doc", accessibilityDescription: title)
+        toolTip = title
+        setAccessibilityLabel(title)
+    }
+
+    @objc private func copyText() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        showIcon(copied: true)
+        resetTask?.cancel()
+        resetTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(1.5))
+            guard !Task.isCancelled else { return }
+            self?.showIcon(copied: false)
+        }
     }
 }
 

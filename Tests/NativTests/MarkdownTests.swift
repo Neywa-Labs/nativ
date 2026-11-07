@@ -183,6 +183,17 @@ final class MarkdownGeometryTests: XCTestCase {
         XCTAssertEqual(cache.layout(source, width: 600, style: .init(fontSize: 15)).size, wide.size)
     }
 
+    func testCodeBlocksExposeCopyTextAndScrollLongLines() throws {
+        let command = #"log show --predicate 'process == "Nativ"' --last 1h --style compact --info"#
+        let source = "Run:\n\n```bash\n\(command)\n```\n"
+        let layout = MarkdownLayouter.layout(source, width: 260, style: .init())
+        let code = try XCTUnwrap(layout.blocks.first { $0.copyText != nil })
+        XCTAssertEqual(code.copyText, command)
+        XCTAssertTrue(code.scrollsHorizontally)
+        XCTAssertGreaterThan(code.contentSize.width, code.frame.width)
+        XCTAssertEqual(layout.blocks.filter { $0.copyText != nil }.count, 1)
+    }
+
     func testTablesFitWrapAndKeepColumnAlignment() throws {
         let source = """
             | Name | Notes | Context |
