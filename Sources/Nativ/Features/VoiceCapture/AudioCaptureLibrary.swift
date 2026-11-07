@@ -1003,6 +1003,7 @@ final class AudioCaptureLibrary: ObservableObject {
         let recordID = recordingURL.deletingPathExtension().lastPathComponent
         let analysisClient = kind == .meeting ? try await audioAnalysisClient() : nil
         let transcript: String
+        let transcriptionFinishReason: String?
         let modelID: String
         var diarization: AudioDiarization?
         if let analysisClient {
@@ -1024,12 +1025,15 @@ final class AudioCaptureLibrary: ObservableObject {
                     status: "Transcribing meeting… \(Int(end)) / \(Int(duration)) sec")
             }
             transcript = result.text
+            transcriptionFinishReason = nil
             diarization = result.diarization
         } else {
             let backend = try await transcriptionBackend()
             modelID = backend.modelID
             transcribingRecordIDs.insert(recordID)
-            transcript = try await backend.transcribe(recordingURL).trimmingCharacters(in: .whitespacesAndNewlines)
+            let result = try await backend.transcribe(recordingURL)
+            transcript = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            transcriptionFinishReason = result.finishReason
         }
         guard !transcript.isEmpty else { throw AudioCaptureLibraryError.emptyTranscript }
         try Task.checkCancellation()
@@ -1050,7 +1054,8 @@ final class AudioCaptureLibrary: ObservableObject {
             title: analytics.record(withID: recordID)?.title ?? title,
             persistAudioReference: true,
             preserveExistingSummary: preserveExistingSummary,
-            diarization: diarization
+            diarization: diarization,
+            transcriptionFinishReason: transcriptionFinishReason
         )
     }
 
@@ -1061,7 +1066,7 @@ final class AudioCaptureLibrary: ObservableObject {
     }
 
     private func transcriptionBackend() async throws -> (
-        modelID: String, transcribe: (URL) async throws -> String
+        modelID: String, transcribe: (URL) async throws -> NativAudioTranscription
     ) {
         guard let configuration = transcriptionConfigurationProvider?() else {
             throw AudioCaptureLibraryError.serverNotRunning
@@ -1069,7 +1074,8 @@ final class AudioCaptureLibrary: ObservableObject {
         if #available(macOS 27.0, *),
            DefaultSpeechModel.isPreferred(selectedModelID: configuration.selectedModelID) {
             return (DefaultSpeechModel.identifier, { url in
-                try await ParakeetTranscriber.shared.transcribe(contentsOf: url).text
+                let result = try await ParakeetTranscriber.shared.transcribe(contentsOf: url)
+                return NativAudioTranscription(text: result.text)
             })
         }
         guard configuration.serverIsRunning else {
@@ -1091,7 +1097,7 @@ final class AudioCaptureLibrary: ObservableObject {
         let apiKey = configuration.serverAPIKey
         return (modelID, { url in
             let client = NativAudioClient(baseURL: baseURL, apiKey: apiKey)
-            return try await client.transcribe(fileURL: url, model: modelID).text
+            return try await client.transcribe(fileURL: url, model: modelID)
         })
     }
 

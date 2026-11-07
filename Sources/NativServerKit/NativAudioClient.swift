@@ -27,9 +27,16 @@ public enum NativAudioTranscriptionError: Error, LocalizedError, CustomStringCon
 
 public struct NativAudioTranscription: Decodable, Equatable, Sendable {
     public let text: String
+    public let finishReason: String?
 
-    public init(text: String) {
+    public init(text: String, finishReason: String? = nil) {
         self.text = text
+        self.finishReason = finishReason
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case text
+        case finishReason = "finish_reason"
     }
 }
 

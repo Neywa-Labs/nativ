@@ -38,6 +38,11 @@ struct AudioTranscriptionRecord: Codable, Equatable, Identifiable, Sendable {
     let audioFileName: String?
     let summary: String?
     var diarization: AudioDiarization? = nil
+    var transcriptionFinishReason: String? = nil
+
+    var isTranscriptIncomplete: Bool {
+        transcriptionFinishReason == "length"
+    }
 
     var displayTranscript: String {
         diarization?.formattedTranscript ?? transcript
@@ -317,6 +322,7 @@ final class AudioAnalyticsStore: ObservableObject {
         summary: String? = nil,
         preserveExistingSummary: Bool = true,
         diarization: AudioDiarization? = nil,
+        transcriptionFinishReason: String? = nil,
         recordedAt: Date? = nil,
         updatedAt: Date = Date()
     ) throws {
@@ -354,7 +360,8 @@ final class AudioAnalyticsStore: ObservableObject {
                 ? recordingURL.lastPathComponent
                 : existing?.audioFileName,
             summary: summary ?? (preserveExistingSummary ? existing?.summary : nil),
-            diarization: resolvedDiarization
+            diarization: resolvedDiarization,
+            transcriptionFinishReason: transcriptionFinishReason
         )
         updatedRecords.removeAll { $0.id == id }
         updatedRecords.append(record)
@@ -401,7 +408,8 @@ final class AudioAnalyticsStore: ObservableObject {
             title: existing.title,
             audioFileName: existing.audioFileName,
             summary: summary,
-            diarization: existing.diarization
+            diarization: existing.diarization,
+            transcriptionFinishReason: existing.transcriptionFinishReason
         )
         records.removeAll { $0.id == recordID }
         records.append(record)
@@ -429,7 +437,8 @@ final class AudioAnalyticsStore: ObservableObject {
             title: normalizedTitle,
             audioFileName: existing.audioFileName,
             summary: existing.summary,
-            diarization: existing.diarization
+            diarization: existing.diarization,
+            transcriptionFinishReason: existing.transcriptionFinishReason
         )
         records.removeAll { $0.id == recordID }
         records.append(record)
@@ -625,7 +634,8 @@ final class AudioAnalyticsStore: ObservableObject {
             title: record.title,
             audioFileName: record.audioFileName,
             summary: record.summary,
-            diarization: record.diarization
+            diarization: record.diarization,
+            transcriptionFinishReason: record.transcriptionFinishReason
         )
     }
 

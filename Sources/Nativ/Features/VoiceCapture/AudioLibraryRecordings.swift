@@ -51,6 +51,7 @@ struct AudioLibraryRecordings: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Open summary for \(record.displayTitle)")
+            .accessibilityValue(record.isTranscriptIncomplete ? "Incomplete transcript" : "")
             .accessibilityIdentifier("audio.library.open.\(record.id)")
             VStack(alignment: .trailing, spacing: 22) {
                 controls(record)
@@ -84,6 +85,10 @@ struct AudioLibraryRecordings: View {
                 }
             }
             .font(.caption).foregroundStyle(.secondary)
+            if record.isTranscriptIncomplete {
+                Label("Incomplete transcript", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange)
+            }
             if library.processingRecordIDs.contains(record.id) {
                 AudioRecordingProgress(recordID: record.id, library: library)
             }

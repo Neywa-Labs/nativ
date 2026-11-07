@@ -73,6 +73,11 @@ struct AudioRecordingDetail: View {
 
             header
 
+            if record.isTranscriptIncomplete {
+                Label("Incomplete transcript. Transcription reached its output limit.", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout).foregroundStyle(.orange)
+            }
+
             VStack(spacing: 0) {
                 toolbar
                 Divider()
@@ -301,7 +306,7 @@ struct AudioRecordingDetail: View {
                 .font(.title3.weight(.semibold))
             Text(record.transcript.isEmpty
                  ? "Create a transcript to turn this recording into searchable text and a summary."
-                 : "Get an overview, key points, and action items. The full transcript is available in the Transcript tab.")
+                 : "Get an overview, key points, and action items. The transcript is available in the Transcript tab.")
                 .font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center).frame(maxWidth: 420)
             if !isProcessing {

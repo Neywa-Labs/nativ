@@ -462,6 +462,38 @@ final class AudioAnalyticsStoreTests: XCTestCase {
         XCTAssertEqual(reloaded.records.first?.displayTitle, "Product launch idea")
     }
 
+    func testIncompleteTranscriptSurvivesEditsAndReloadUntilReplaced() throws {
+        let recordingURL = temporaryDirectory.appendingPathComponent("recording.wav")
+        let storageURL = temporaryDirectory.appendingPathComponent("analytics.json")
+        try store.saveTranscription(
+            recordingURL: recordingURL,
+            transcript: "Partial transcript",
+            durationSeconds: 60,
+            modelID: "local-asr",
+            applicationName: nil,
+            kind: .voiceNote,
+            transcriptionFinishReason: "length"
+        )
+        store.updateTitle("Renamed recording", for: "recording")
+        store.updateSummary("Summary", for: "recording")
+
+        let reloaded = AudioAnalyticsStore(storageURL: storageURL)
+        let record = try XCTUnwrap(reloaded.record(withID: "recording"))
+        XCTAssertEqual(record.transcript, "Partial transcript")
+        XCTAssertTrue(record.isTranscriptIncomplete)
+
+        try reloaded.saveTranscription(
+            recordingURL: recordingURL,
+            transcript: "Replacement transcript",
+            durationSeconds: 60,
+            modelID: "local-asr",
+            applicationName: nil
+        )
+        let replacement = try XCTUnwrap(AudioAnalyticsStore(storageURL: storageURL).record(withID: "recording"))
+        XCTAssertEqual(replacement.transcript, "Replacement transcript")
+        XCTAssertFalse(replacement.isTranscriptIncomplete)
+    }
+
     func testImportedCaptureUsesImportDateAndPreservesItAfterTranscription() throws {
         let earlierRecordingURL = temporaryDirectory.appendingPathComponent("earlier.wav")
         let uploadedAudioURL = temporaryDirectory.appendingPathComponent("uploaded.m4a")
@@ -894,6 +926,19 @@ final class PushToTalkHoldStateTests: XCTestCase {
 }
 
 final class NativAudioClientTests: XCTestCase {
+    func testTranscriptionDecodesTextWithOrWithoutFinishReason() throws {
+        let decoder = JSONDecoder()
+        let capped = try decoder.decode(NativAudioTranscription.self,
+            from: Data(#"{"text":"Partial transcript","finish_reason":"length"}"#.utf8))
+        let legacy = try decoder.decode(NativAudioTranscription.self,
+            from: Data(#"{"text":"Legacy transcript"}"#.utf8))
+
+        XCTAssertEqual(capped.text, "Partial transcript")
+        XCTAssertEqual(capped.finishReason, "length")
+        XCTAssertEqual(legacy.text, "Legacy transcript")
+        XCTAssertNil(legacy.finishReason)
+    }
+
     func testDiarizedStreamKeepsSpeakerMappingAndRejectsIncompleteResults() async throws {
         let pcm = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try Data(repeating: 0, count: 2048).write(to: pcm)
