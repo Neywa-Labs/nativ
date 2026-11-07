@@ -23,12 +23,16 @@ struct ChatListAgentsToolResultPayload: Encodable {
         let task: String
         let status: String
         let stopReason: String?
+        var model: String? = nil
+        var category: String? = nil
 
         enum CodingKeys: String, CodingKey {
             case agentID = "agent_id"
             case task
             case status
             case stopReason = "stop_reason"
+            case model
+            case category
         }
     }
 
@@ -45,7 +49,9 @@ struct ChatListAgentsToolExecutor {
                 agentID: $0.id,
                 task: $0.task,
                 status: $0.status.rawValue,
-                stopReason: $0.stopReason?.rawValue
+                stopReason: $0.stopReason?.rawValue,
+                model: $0.category == nil ? nil : $0.modelID,
+                category: $0.category
             )
         }
         return (try? encodedPayload(ChatListAgentsToolResultPayload(ok: true, agents: agents, error: nil)))

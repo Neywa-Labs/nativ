@@ -63,6 +63,7 @@ struct SettingsView: View {
                 pageHeader
                 generalSettings
                 projectSettings
+                WorkerSubagentsSettingsSection(model: model)
                 permissionSettings
                 advancedSettings
             }

@@ -34,6 +34,7 @@ struct ChatSpawnedAgentRecord: Identifiable, Equatable, Sendable {
 
     let startedAt: Date
     var finishedAt: Date?
+    var category: String? = nil
 }
 
 /// In-memory only. Owned by ChatViewModel so it survives session switches
@@ -47,7 +48,7 @@ final class ChatAgentRegistry {
     private var tasks: [String: Task<Void, Never>] = [:]
     private var pendingSteerMessages: [String: [String]] = [:]
 
-    func register(task: String, modelID: String?) -> String {
+    func register(task: String, modelID: String?, category: String? = nil) -> String {
         let id = "agent_\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
         records[id] = ChatSpawnedAgentRecord(
             id: id,
@@ -58,7 +59,8 @@ final class ChatAgentRegistry {
             result: nil,
             error: nil,
             startedAt: Date(),
-            finishedAt: nil
+            finishedAt: nil,
+            category: category
         )
         order.append(id)
         return id

@@ -644,6 +644,8 @@ struct NativSettings: Codable, Equatable {
     var fileReadRootPath: String?
     var fileWriteRootPath: String?
     var projectToolsEnabled: Bool
+    var workerSubagentsEnabled: Bool
+    var workerContextTokens: Int
     var skills: [NativSkill]
     var imageGenerationModelID: String?
     var textToSpeechModelID: String?
@@ -706,6 +708,8 @@ struct NativSettings: Codable, Equatable {
         fileReadRootPath: String? = nil,
         fileWriteRootPath: String? = nil,
         projectToolsEnabled: Bool = true,
+        workerSubagentsEnabled: Bool = false,
+        workerContextTokens: Int = 8192,
         skills: [NativSkill] = [],
         imageGenerationModelID: String? = nil,
         textToSpeechModelID: String? = nil,
@@ -766,6 +770,8 @@ struct NativSettings: Codable, Equatable {
         self.fileReadRootPath = fileReadRootPath
         self.fileWriteRootPath = fileWriteRootPath
         self.projectToolsEnabled = projectToolsEnabled
+        self.workerSubagentsEnabled = workerSubagentsEnabled
+        self.workerContextTokens = workerContextTokens
         self.skills = skills
         self.imageGenerationModelID = imageGenerationModelID
         self.textToSpeechModelID = textToSpeechModelID
@@ -828,6 +834,8 @@ struct NativSettings: Codable, Equatable {
         case fileReadRootPath
         case fileWriteRootPath
         case projectToolsEnabled
+        case workerSubagentsEnabled
+        case workerContextTokens
         case skills
         case imageGenerationModelID
         case textToSpeechModelID
@@ -918,6 +926,12 @@ struct NativSettings: Codable, Equatable {
         projectToolsEnabled =
             try container.decodeIfPresent(Bool.self, forKey: .projectToolsEnabled)
             ?? defaults.projectToolsEnabled
+        workerSubagentsEnabled =
+            try container.decodeIfPresent(Bool.self, forKey: .workerSubagentsEnabled)
+            ?? defaults.workerSubagentsEnabled
+        workerContextTokens =
+            try container.decodeIfPresent(Int.self, forKey: .workerContextTokens)
+            ?? defaults.workerContextTokens
         skills =
             try container.decodeIfPresent([NativSkill].self, forKey: .skills) ?? defaults.skills
         imageGenerationModelID =
@@ -1059,6 +1073,8 @@ struct NativSettings: Codable, Equatable {
         try container.encodeIfPresent(fileReadRootPath, forKey: .fileReadRootPath)
         try container.encodeIfPresent(fileWriteRootPath, forKey: .fileWriteRootPath)
         try container.encode(projectToolsEnabled, forKey: .projectToolsEnabled)
+        try container.encode(workerSubagentsEnabled, forKey: .workerSubagentsEnabled)
+        try container.encode(workerContextTokens, forKey: .workerContextTokens)
         try container.encode(skills, forKey: .skills)
         try container.encodeIfPresent(imageGenerationModelID, forKey: .imageGenerationModelID)
         try container.encodeIfPresent(textToSpeechModelID, forKey: .textToSpeechModelID)
@@ -1281,6 +1297,7 @@ struct NativSettings: Codable, Equatable {
         settings.serverPort = min(max(settings.serverPort, 1), 65_535)
         settings.maxTokens = min(max(settings.maxTokens, 1), 262_144)
         settings.maxKVSize = min(max(settings.maxKVSize, 0), 1_048_576)
+        settings.workerContextTokens = min(max(settings.workerContextTokens, 1024), 131_072)
         settings.compactionThresholdPercent = min(max(settings.compactionThresholdPercent, 20), 90)
         settings.systemPrompt = settings.systemPrompt.trimmingCharacters(
             in: .whitespacesAndNewlines)

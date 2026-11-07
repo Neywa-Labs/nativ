@@ -8,7 +8,7 @@ typealias ChatImageModelSelectionHandler =
 
 struct ChatToolExecutionContext: Sendable {
     let imageGenerationModelID: String?
-    let baseURL: URL
+    var baseURL: URL
     let apiKey: String?
     let imageReferences: [ChatImageAttachment]
     let modelSearchPath: String
@@ -40,6 +40,7 @@ struct ChatToolExecutionContext: Sendable {
     var spawnAgentParentMessages: [ChatTranscriptMessage] = []
     var spawnAgentUpdate: (@MainActor @Sendable ([ChatTranscriptMessage]) -> Void)? = nil
     var agentRegistry: ChatAgentRegistry? = nil
+    var workerRouting: ChatWorkerRouting? = nil
     var subAgentToolDefinitions: [MLXChatToolDefinition]? = nil
     var subAgentSystemPrompt: String? = nil
     var projectScope: ChatToolScope? = nil
@@ -334,6 +335,10 @@ enum ChatToolDispatcher {
         ChatSpawnAgentToolRegistry.toolName: { call, context in
             try await executeSpawnAgentTool(call: call, context: context)
         },
+        ChatSuggestWorkersToolRegistry.toolName: { call, context in
+            let content = try await ChatSuggestWorkersToolExecutor().execute(call: call, context: context)
+            return ChatToolExecutionOutcome(content: content, attachments: [])
+        },
         ChatListAgentsToolRegistry.toolName: { _, context in
             let content = await ChatListAgentsToolExecutor().execute(registry: context.agentRegistry)
             return ChatToolExecutionOutcome(content: content, attachments: [])
@@ -393,6 +398,9 @@ enum ChatToolDispatcher {
         },
         ChatSpawnAgentToolRegistry.toolName: { _, error in
             ChatSpawnAgentToolExecutor().failurePayload(error: error)
+        },
+        ChatSuggestWorkersToolRegistry.toolName: { _, error in
+            ChatSuggestWorkersToolExecutor().failurePayload(error: error)
         },
         ChatListAgentsToolRegistry.toolName: { _, error in
             ChatListAgentsToolExecutor().failurePayload(error: error)

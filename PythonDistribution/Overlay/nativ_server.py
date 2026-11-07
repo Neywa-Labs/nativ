@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from contextvars import ContextVar
@@ -1499,7 +1500,54 @@ def install_metrics_overlay() -> None:
         return {"status": "queued", "routine_id": routine_id}
 
 
+def apply_mlx_memory_limits(environ, mx_module) -> dict:
+    applied = {}
+    for name, key, setter in (
+        ("NATIV_MLX_MEMORY_LIMIT_BYTES", "memory", "set_memory_limit"),
+        ("NATIV_MLX_CACHE_LIMIT_BYTES", "cache", "set_cache_limit"),
+    ):
+        try:
+            value = int(environ.get(name, ""))
+        except ValueError:
+            continue
+        if value <= 0:
+            continue
+        getattr(mx_module, setter)(value)
+        applied[key] = value
+    return applied
+
+
+def worker_parent_has_exited(environ, kill=None) -> bool:
+    try:
+        pid = int(environ.get("NATIV_PARENT_PID", ""))
+    except ValueError:
+        return False
+    if pid <= 1:
+        return False
+    try:
+        (kill or os.kill)(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def start_worker_parent_watchdog(environ) -> None:
+    if not environ.get("NATIV_PARENT_PID"):
+        return
+
+    def watch():
+        while not worker_parent_has_exited(environ):
+            time.sleep(1)
+        os._exit(0)
+
+    threading.Thread(target=watch, name="nativ-parent-watchdog", daemon=True).start()
+
+
 def main() -> None:
+    apply_mlx_memory_limits(os.environ, mx)
+    start_worker_parent_watchdog(os.environ)
     install_metrics_overlay()
     install_metrics_access_log_filter()
     original_argparse = base_cli.argparse

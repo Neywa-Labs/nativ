@@ -4,14 +4,8 @@ import NativServerKit
 enum ChatSpawnAgentToolRegistry {
     static let toolName = "spawn_agent"
 
-    static func definitions() -> [MLXChatToolDefinition] {
-        [MLXChatToolDefinition(function: MLXChatFunctionDefinition(
-            name: toolName,
-            description: "Delegate a sub-task to a separate, independent agent.",
-            parameters: .object([
-                "type": .string("object"),
-                "additionalProperties": .bool(false),
-                "properties": .object([
+    static func definitions(workerCategories: [String]? = nil) -> [MLXChatToolDefinition] {
+        var properties: [String: MLXJSONValue] = [
                     "task": .object([
                         "type": .string("string"),
                         "description": .string("The sub-agent's instruction.")
@@ -37,7 +31,23 @@ enum ChatSpawnAgentToolRegistry {
                             "If true, returns an agent_id immediately instead of waiting, using the parent's model. Check via check_agent/list_agents. Different-model workers must run in the foreground; they are serialized with other workers to avoid unloading an active model. Defaults to false."
                         )
                     ])
-                ]),
+        ]
+        if let workerCategories {
+            properties["category"] = .object([
+                "type": .string("string"),
+                "enum": .array(workerCategories.map { .string($0) }),
+                "description": .string(
+                    "Label this sub-task so it runs on a fast worker model picked for that kind of work."
+                )
+            ])
+        }
+        return [MLXChatToolDefinition(function: MLXChatFunctionDefinition(
+            name: toolName,
+            description: "Delegate a sub-task to a separate, independent agent.",
+            parameters: .object([
+                "type": .string("object"),
+                "additionalProperties": .bool(false),
+                "properties": .object(properties),
                 "required": .array([.string("task")])
             ])
         ))]
@@ -73,6 +83,7 @@ struct ChatSpawnAgentToolArguments: Decodable {
     let context: String?
     let modelID: String?
     let runInBackground: Bool
+    let category: String?
     let resourceLimits = ChatSpawnAgentResourceLimits.default
 
     enum CodingKeys: String, CodingKey {
@@ -81,6 +92,7 @@ struct ChatSpawnAgentToolArguments: Decodable {
         case context
         case modelID = "model"
         case runInBackground = "run_in_background"
+        case category
     }
 
     init(from decoder: Decoder) throws {
@@ -90,6 +102,7 @@ struct ChatSpawnAgentToolArguments: Decodable {
         context = try container.decodeIfPresent(String.self, forKey: .context)
         modelID = try container.decodeIfPresent(String.self, forKey: .modelID)
         runInBackground = try container.decodeIfPresent(Bool.self, forKey: .runInBackground) ?? false
+        category = try container.decodeIfPresent(String.self, forKey: .category)
     }
 
     static func runsInBackground(_ argumentsJSON: String?) -> Bool {
@@ -109,6 +122,11 @@ struct ChatSpawnAgentToolResultPayload: Encodable {
     let stopReason: String?
     let answer: String?
     let error: String?
+    var model: String? = nil
+    var category: String? = nil
+    var worker: String? = nil
+    var note: String? = nil
+    var suggestion: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -117,6 +135,11 @@ struct ChatSpawnAgentToolResultPayload: Encodable {
         case stopReason = "stop_reason"
         case answer
         case error
+        case model
+        case category
+        case worker
+        case note
+        case suggestion
     }
 }
 
@@ -213,6 +236,10 @@ struct ChatSpawnAgentPreparedCall {
     let onUpdate: (@MainActor @Sendable ([ChatTranscriptMessage]) -> Void)?
     let registry: ChatAgentRegistry?
     let limits: ChatSpawnAgentResourceLimits
+    var workerRoute: ChatSpawnAgentWorkerRoute? = nil
+    var category: String? = nil
+    var routeNote: String? = nil
+    var suggestion: String? = nil
 }
 
 struct ChatSpawnAgentToolExecutor {
@@ -237,23 +264,81 @@ struct ChatSpawnAgentToolExecutor {
             throw ChatSpawnAgentToolError.modelUnavailable(modelID: nil)
         }
 
-        try Task.checkCancellation()
-        let modelID = try await ChatSpawnAgentModelResolver.resolve(
-            requestedModelID: arguments.modelID,
-            fallbackModelID: settings.languageModelID,
-            searchPaths: LocalModelSearchPaths(
-                primary: context.modelSearchPath,
-                additional: context.additionalModelSearchPaths
-            )
-        )
-        try Task.checkCancellation()
-        if arguments.runInBackground, modelID != settings.languageModelID {
-            throw ChatSpawnAgentToolError.backgroundModelSwitch
-        }
         let messages = try ChatSpawnAgentTranscriptBuilder.initialMessages(
             arguments: arguments,
             parentMessages: context.spawnAgentParentMessages
         )
+        try Task.checkCancellation()
+        var runSettings = settings
+        var workerRoute: ChatSpawnAgentWorkerRoute?
+        var routedCategory: String?
+        var routeNote: String?
+        var suggestion: String?
+        var modelID: String?
+        var requestedModelID = arguments.modelID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if requestedModelID?.isEmpty == true { requestedModelID = nil }
+        if let routing = context.workerRouting, let requestedCategory = arguments.category {
+            let environment = await routing.environment()
+            let pick = WorkerModelPicker.pick(category: requestedCategory, environment: environment)
+            let decision = ChatSpawnAgentRouting.decide(
+                modelID: requestedModelID,
+                modelIsDownloaded: requestedModelID.map(environment.downloadedRepoIDs.contains) ?? false,
+                category: requestedCategory,
+                pick: pick,
+                estimatedPromptTokens: ChatSpawnAgentRouting.estimatedTokens(messages),
+                workerContextTokens: routing.workerContextTokens
+            )
+            // Managers often pass the model suggest_workers named; if it isn't downloaded, use the category pick.
+            var overrideNote: String?
+            if decision != .parent {
+                routedCategory = pick.category
+                if let ignored = requestedModelID {
+                    overrideNote = "\(ignored) isn't downloaded; used the \(pick.category) pick instead"
+                    requestedModelID = nil
+                }
+            }
+            switch decision {
+            case .worker(let candidate, let isFallback):
+                routeNote = overrideNote
+                modelID = candidate.repoID
+                runSettings = ChatSpawnAgentRouting.workerSettings(settings, workerModelID: candidate.repoID)
+                suggestion = ChatSpawnAgentRouting.suggestion(
+                    recommended: pick.recommended, ran: candidate, isFallback: isFallback)
+                workerRoute = ChatSpawnAgentWorkerRoute(
+                    candidate: candidate,
+                    summary: ChatSpawnAgentRouting.summary(
+                        candidate, requestedCategory: pick.category, isFallback: isFallback),
+                    ensureEndpoint: routing.ensureEndpoint
+                )
+            case .manager(let note):
+                routeNote = [overrideNote, note].compactMap { $0 }.joined(separator: "; ")
+                // When workers are blocked by memory, another download wouldn't help.
+                suggestion = pick.blockedByMemory
+                    ? nil
+                    : ChatSpawnAgentRouting.suggestion(
+                        recommended: pick.recommended, ran: nil, isFallback: false)
+            case .parent:
+                break
+            }
+        }
+        let resolvedModelID: String
+        if let modelID {
+            resolvedModelID = modelID
+        } else {
+            resolvedModelID = try await ChatSpawnAgentModelResolver.resolve(
+                requestedModelID: requestedModelID,
+                fallbackModelID: settings.languageModelID,
+                searchPaths: LocalModelSearchPaths(
+                    primary: context.modelSearchPath,
+                    additional: context.additionalModelSearchPaths
+                )
+            )
+        }
+        try Task.checkCancellation()
+        // Worker spawns use their own server slot, so they may run in the background.
+        if arguments.runInBackground, workerRoute == nil, resolvedModelID != settings.languageModelID {
+            throw ChatSpawnAgentToolError.backgroundModelSwitch
+        }
         let parentImages = context.spawnAgentParentMessages.reversed().lazy
             .map { $0.imageAttachments.filter { $0.chatAttachmentKind == .image } }
             .first { !$0.isEmpty } ?? []
@@ -269,15 +354,17 @@ struct ChatSpawnAgentToolExecutor {
         subAgentContext.settings = nil
         subAgentContext.spawnAgentParentMessages = []
         subAgentContext.spawnAgentUpdate = nil
+        subAgentContext.workerRouting = nil
 
-        let agentID = await context.agentRegistry?.register(task: arguments.task, modelID: modelID)
+        let agentID = await context.agentRegistry?.register(
+            task: arguments.task, modelID: resolvedModelID, category: routedCategory)
             ?? UUID().uuidString
 
         return ChatSpawnAgentPreparedCall(
             agentID: agentID,
-            modelID: modelID,
+            modelID: resolvedModelID,
             messages: messages,
-            settings: settings,
+            settings: runSettings,
             canEditImage: !parentImages.isEmpty,
             subAgentContext: subAgentContext,
             onUpdate: context.spawnAgentUpdate,
@@ -286,7 +373,11 @@ struct ChatSpawnAgentToolExecutor {
                 maxTurns: arguments.resourceLimits.maxTurns,
                 maxTokens: settings.maxTokens,
                 maxWallTimeSeconds: arguments.resourceLimits.maxWallTimeSeconds
-            )
+            ),
+            workerRoute: workerRoute,
+            category: routedCategory,
+            routeNote: routeNote,
+            suggestion: suggestion
         )
     }
 
@@ -295,7 +386,11 @@ struct ChatSpawnAgentToolExecutor {
         do {
             try Task.checkCancellation()
             let result = try await ChatAgentLoop.withTimeout(seconds: prepared.limits.maxWallTimeSeconds) {
-                let endpoint = prepared.subAgentContext.baseURL
+                var context = prepared.subAgentContext
+                if let route = prepared.workerRoute {
+                    context.baseURL = try await route.ensureEndpoint()
+                }
+                let endpoint = context.baseURL
                 try await ChatAgentModelGate.shared.acquire(modelID: prepared.modelID, endpoint: endpoint)
                 defer { ChatAgentModelGate.shared.release(endpoint: endpoint) }
                 return try await ChatAgentLoop.run(
@@ -303,7 +398,7 @@ struct ChatSpawnAgentToolExecutor {
                     modelID: prepared.modelID,
                     settings: prepared.settings,
                     canEditImage: prepared.canEditImage,
-                    context: prepared.subAgentContext,
+                    context: context,
                     agentID: prepared.agentID,
                     limits: prepared.limits,
                     onUpdate: prepared.onUpdate
@@ -311,45 +406,46 @@ struct ChatSpawnAgentToolExecutor {
             }
             if let stopReason = result.stopReason {
                 await prepared.registry?.stop(prepared.agentID, reason: stopReason, partialResult: result.completion.content)
-                return (try? encodedPayload(ChatSpawnAgentToolResultPayload(
+                return (try? encodedPayload(annotated(ChatSpawnAgentToolResultPayload(
                     ok: true,
                     agentID: prepared.agentID,
                     status: ChatSpawnedAgentStatus.stopped.rawValue,
                     stopReason: stopReason.rawValue,
                     answer: result.completion.content,
                     error: nil
-                ))) ?? #"{"ok":true}"#
+                ), prepared))) ?? #"{"ok":true}"#
             }
             await prepared.registry?.complete(prepared.agentID, result: result.completion.content)
-            return (try? encodedPayload(ChatSpawnAgentToolResultPayload(
+            return (try? encodedPayload(annotated(ChatSpawnAgentToolResultPayload(
                 ok: true,
                 agentID: prepared.agentID,
                 status: ChatSpawnedAgentStatus.completed.rawValue,
                 stopReason: nil,
                 answer: result.completion.content,
                 error: nil
-            ))) ?? #"{"ok":true}"#
+            ), prepared))) ?? #"{"ok":true}"#
         } catch ChatAgentLoopError.timedOut {
             await prepared.registry?.stop(prepared.agentID, reason: .timeout, partialResult: nil)
-            return (try? encodedPayload(ChatSpawnAgentToolResultPayload(
+            return (try? encodedPayload(annotated(ChatSpawnAgentToolResultPayload(
                 ok: true, agentID: prepared.agentID,
                 status: ChatSpawnedAgentStatus.stopped.rawValue,
                 stopReason: ChatSpawnedAgentStopReason.timeout.rawValue,
                 answer: nil, error: nil
-            ))) ?? #"{"ok":false,"error":"Sub-agent timed out."}"#
+            ), prepared))) ?? #"{"ok":false,"error":"Sub-agent timed out."}"#
         } catch is CancellationError {
             await prepared.registry?.stop(prepared.agentID, reason: .cancelled, partialResult: nil)
-            return (try? encodedPayload(ChatSpawnAgentToolResultPayload(
+            return (try? encodedPayload(annotated(ChatSpawnAgentToolResultPayload(
                 ok: true,
                 agentID: prepared.agentID,
                 status: ChatSpawnedAgentStatus.stopped.rawValue,
                 stopReason: ChatSpawnedAgentStopReason.cancelled.rawValue,
                 answer: nil,
                 error: nil
-            ))) ?? #"{"ok":true}"#
+            ), prepared))) ?? #"{"ok":true}"#
         } catch {
+            let error = ChatSpawnAgentRouting.reportedError(error, onWorker: prepared.workerRoute != nil)
             await prepared.registry?.fail(prepared.agentID, error: error.localizedDescription)
-            return failurePayload(agentID: prepared.agentID, error: error)
+            return failurePayload(agentID: prepared.agentID, error: error, prepared: prepared)
         }
     }
 
@@ -368,8 +464,8 @@ struct ChatSpawnAgentToolExecutor {
         failurePayload(agentID: nil, error: error)
     }
 
-    func failurePayload(agentID: String?, error: Error) -> String {
-        let payload = ChatSpawnAgentToolResultPayload(
+    func failurePayload(agentID: String?, error: Error, prepared: ChatSpawnAgentPreparedCall? = nil) -> String {
+        var payload = ChatSpawnAgentToolResultPayload(
             ok: false,
             agentID: agentID,
             status: agentID == nil ? nil : ChatSpawnedAgentStatus.error.rawValue,
@@ -377,13 +473,131 @@ struct ChatSpawnAgentToolExecutor {
             answer: nil,
             error: error.localizedDescription
         )
+        if let prepared { payload = annotated(payload, prepared) }
         return (try? encodedPayload(payload))
             ?? #"{"ok":false,"error":"spawn_agent failed."}"#
+    }
+
+    private func annotated(
+        _ payload: ChatSpawnAgentToolResultPayload,
+        _ prepared: ChatSpawnAgentPreparedCall
+    ) -> ChatSpawnAgentToolResultPayload {
+        var payload = payload
+        if let route = prepared.workerRoute {
+            payload.model = route.candidate.repoID
+            payload.worker = route.summary
+        } else if prepared.routeNote != nil {
+            payload.model = prepared.modelID
+        }
+        payload.note = prepared.routeNote
+        payload.category = prepared.category
+        payload.suggestion = prepared.suggestion
+        return payload
     }
 
     private func encodedPayload(_ payload: ChatSpawnAgentToolResultPayload) throws -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         return String(decoding: try encoder.encode(payload), as: UTF8.self)
+    }
+}
+
+
+struct ChatSpawnAgentWorkerRoute: Sendable {
+    let candidate: WorkerCandidate
+    let summary: String
+    let ensureEndpoint: @MainActor @Sendable () async throws -> URL
+}
+
+enum ChatSpawnAgentRouteDecision: Equatable {
+    case parent
+    case manager(note: String)
+    case worker(WorkerCandidate, isFallback: Bool)
+}
+
+enum ChatSpawnAgentRouting {
+    static func decide(
+        modelID: String?,
+        modelIsDownloaded: Bool,
+        category: String?,
+        pick: WorkerPick?,
+        estimatedPromptTokens: Int,
+        workerContextTokens: Int
+    ) -> ChatSpawnAgentRouteDecision {
+        if let modelID, !modelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           modelIsDownloaded || category == nil
+        {
+            return .parent
+        }
+        guard category != nil, let pick else { return .parent }
+        guard let runnable = pick.runnable else {
+            if pick.blockedByMemory {
+                return .manager(
+                    note: "no downloaded worker fits in memory next to the manager; lower the manager's Context window in Model Configuration or Worker context in Settings; ran on the manager model")
+            }
+            return .manager(note: "no fast worker downloaded for \(pick.category); ran on the manager model")
+        }
+        if estimatedPromptTokens > workerContextTokens {
+            return .manager(
+                note: "conversation is too long for the worker context (\(estimatedPromptTokens) tokens); ran on the manager model")
+        }
+        return .worker(runnable, isFallback: pick.runnableIsFallback)
+    }
+
+    static func estimatedTokens(_ messages: [MLXChatMessage]) -> Int {
+        messages.reduce(0) { total, message in
+            switch message.content {
+            case .text(let text): total + text.count
+            case .parts(let parts): total + parts.reduce(0) { $0 + ($1.text?.count ?? 0) }
+            case nil: total
+            }
+        } / 4
+    }
+
+    static func workerSettings(_ base: NativSettings, workerModelID: String) -> NativSettings {
+        var settings = base
+        let profile = base.modelProfile(for: workerModelID)
+        settings.thinkingEnabled = profile?.thinkingEnabled ?? false
+        settings.thinkingBudgetEnabled = profile?.thinkingBudgetEnabled ?? false
+        if let profile { settings.thinkingBudget = profile.thinkingBudget }
+        settings.speculativeDecodingEnabled = false
+        return settings
+    }
+
+    static func summary(_ candidate: WorkerCandidate, requestedCategory: String, isFallback: Bool) -> String {
+        let quality = Int(candidate.estimatedQuality.rounded())
+        var text = "ran on \(candidate.repoID) (\(candidate.category), est. speed \(candidate.speed.rawValue), est. quality \(quality))"
+        if isFallback {
+            text += "; no \(requestedCategory) worker downloaded, used the best general worker"
+        }
+        return text
+    }
+
+    static func suggestion(
+        recommended: WorkerCandidate?,
+        ran: WorkerCandidate?,
+        isFallback: Bool
+    ) -> String? {
+        guard let recommended, !recommended.isDownloaded, recommended.repoID != ran?.repoID else { return nil }
+        if let ran, !isFallback, recommended.estimatedQuality <= ran.estimatedQuality { return nil }
+        let gigabytes = String(format: "%.1f", Double(recommended.sizeBytes) / 1_000_000_000)
+        return "better: \(recommended.repoID) (\(gigabytes) GB, not downloaded); suggest the user downloads it"
+    }
+
+    static func reportedError(_ error: Error, onWorker: Bool) -> Error {
+        guard onWorker, error is URLError || error is NativChatError else { return error }
+        if case NativChatError.httpStatus = error { return error }
+        if case NativChatError.serverError = error { return error }
+        return ChatSpawnAgentWorkerError.stopped(error.localizedDescription)
+    }
+}
+
+enum ChatSpawnAgentWorkerError: LocalizedError {
+    case stopped(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .stopped(let detail): "The worker server stopped responding (\(detail)). The next worker spawn restarts it."
+        }
     }
 }

@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Metal
 import NativServerKit
 import Observation
 
@@ -102,6 +103,7 @@ final class NativModel: ChatModelSwitchingSurface {
         didSet {
             settings.save()
             runtimeSettings.setDesired(settings.runtimeSettings)
+            workerServer.apply(settings: settings)
         }
     }
     let runtimeSettings = NativRuntimeSettingsController()
@@ -110,6 +112,7 @@ final class NativModel: ChatModelSwitchingSurface {
     var onMenuStateChanged: (() -> Void)?
 
     private let server = NativProcessController()
+    let workerServer = WorkerServerController()
     private var metricsClient = NativMetricsClient()
     private var metricsFetchTask: Task<Void, Never>?
     private var allTimeStatsLoadTask: Task<Void, Never>?
@@ -519,6 +522,7 @@ final class NativModel: ChatModelSwitchingSurface {
     }
 
     func stopServer(preserveSessionStats: Bool = false) {
+        workerServer.stop()
         stopServer(preserveSessionStats: preserveSessionStats, reason: .stopRequest)
     }
 
@@ -804,6 +808,7 @@ final class NativModel: ChatModelSwitchingSurface {
     }
 
     func applicationWillTerminate() {
+        workerServer.stop()
         stopObservingExternalModelCacheVolume()
         allTimeStatsLoadTask?.cancel()
         allTimeStatsLoadTask = nil
@@ -1007,6 +1012,8 @@ final class NativModel: ChatModelSwitchingSurface {
 
     private func makeExternalModelCacheUnavailable() {
         guard let reference = settings.externalModelCache else { return }
+        // A worker loaded from the external cache keeps its files open and blocks eject.
+        workerServer.stop()
         let unavailableState = ExternalModelCacheReference.State.unavailable(
             path: settings.expandedModelSearchPath,
             reason: .unavailable
@@ -1452,5 +1459,72 @@ final class NativModel: ChatModelSwitchingSurface {
             self.clearPreservedSessionStats()
             self.notifyMenuStateChanged()
         }
+    }
+}
+
+extension NativModel {
+    func workerRouting(for settings: NativSettings) -> ChatWorkerRouting? {
+        guard settings.workerSubagentsEnabled else { return nil }
+        let settings = settings.normalized()
+        let searchPaths = LocalModelSearchPaths(
+            primary: settings.expandedModelSearchPath,
+            additional: settings.additionalModelSearchPaths
+        )
+        let managerModelID = settings.languageModelID
+        let managerMaxKVSize = settings.maxKVSize
+        let contextTokens = settings.workerContextTokens
+        let workingSetBytes = Int64(clamping: MTLCreateSystemDefaultDevice()?.recommendedMaxWorkingSetSize
+            ?? ProcessInfo.processInfo.physicalMemory / 3 * 2)
+        let bandwidth = AppleSiliconBandwidth.gigabytesPerSecond(chipName: AppleSiliconBandwidth.currentChipName())
+        let analyticsPath = currentAnalyticsDatabaseURL()
+            .deletingLastPathComponent()
+            .appendingPathComponent("worker-analytics.sqlite")
+            .path
+        var baseEnvironment = settings.launchEnvironment
+        if let effectiveHuggingFaceToken {
+            baseEnvironment[HuggingFaceAuthentication.environmentVariableName] = effectiveHuggingFaceToken
+        }
+        let launchEnvironment = baseEnvironment
+
+        let environment: @Sendable () async -> WorkerPickEnvironment = {
+            let catalog = WorkerModelCatalog.bundled
+            let models = (try? await LocalModelDiscovery.scan(searchPaths: searchPaths)) ?? []
+            let manager = models.first { $0.repoID == managerModelID }
+            let managerKV = catalog.models.first { base in
+                base.variants.contains { $0.repoID == managerModelID }
+            }?.kvBytesPerToken
+            let budget = WorkerMemoryBudget.workerBudgetBytes(
+                workingSetBytes: workingSetBytes,
+                managerWeightsBytes: manager?.sizeBytes ?? 0,
+                managerKVBytesPerToken: managerKV,
+                managerContextTokens: managerMaxKVSize > 0 ? managerMaxKVSize : manager?.contextSize
+            )
+            return WorkerPickEnvironment(
+                catalog: catalog,
+                downloadedRepoIDs: Set(models.map(\.repoID)),
+                budgetBytes: budget,
+                contextTokens: contextTokens,
+                bandwidthGBps: bandwidth,
+                excludedRepoIDs: managerModelID.map { [$0] } ?? []
+            )
+        }
+
+        return ChatWorkerRouting(
+            workerContextTokens: contextTokens,
+            environment: environment,
+            ensureEndpoint: { [weak self] in
+                guard let self else { throw WorkerServerError.unavailable }
+                let budget = await environment().budgetBytes
+                return try await self.workerServer.ensureRunning(
+                    settings: settings,
+                    environment: WorkerServerLaunchPlan.environment(
+                        base: launchEnvironment,
+                        analyticsDatabasePath: analyticsPath,
+                        memoryLimitBytes: budget,
+                        cacheLimitBytes: WorkerServerController.cacheLimitBytes
+                    )
+                )
+            }
+        )
     }
 }

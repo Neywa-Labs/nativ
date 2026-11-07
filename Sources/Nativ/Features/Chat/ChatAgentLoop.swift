@@ -209,6 +209,7 @@ enum ChatAgentLoop {
         definitions.removeAll { definition in
             definition.function.name == ChatSwitchModelToolRegistry.toolName
                 || definition.function.name == ChatSpawnAgentToolRegistry.toolName
+                || definition.function.name == ChatSuggestWorkersToolRegistry.toolName
                 || definition.function.name == ChatListAgentsToolRegistry.toolName
                 || definition.function.name == ChatCheckAgentToolRegistry.toolName
                 || definition.function.name == ChatSteerAgentToolRegistry.toolName

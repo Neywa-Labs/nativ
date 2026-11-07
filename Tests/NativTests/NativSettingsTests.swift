@@ -22,6 +22,27 @@ final class NativSettingsTests: XCTestCase {
         XCTAssertEqual(settings.temperature, NativSettings().temperature)
     }
 
+    func testWorkerSettingsDefaultWhenMissingFromJSON() throws {
+        for settings in [NativSettings(), try JSONDecoder().decode(NativSettings.self, from: Data("{}".utf8))] {
+            XCTAssertFalse(settings.workerSubagentsEnabled)
+            XCTAssertEqual(settings.workerContextTokens, 8192)
+        }
+        var enabled = NativSettings()
+        enabled.workerSubagentsEnabled = true
+        enabled.workerContextTokens = 16_384
+        let restored = try JSONDecoder().decode(NativSettings.self, from: JSONEncoder().encode(enabled))
+        XCTAssertTrue(restored.workerSubagentsEnabled)
+        XCTAssertEqual(restored.workerContextTokens, 16_384)
+    }
+
+    func testWorkerContextTokensAreClamped() {
+        var settings = NativSettings()
+        settings.workerContextTokens = 100
+        XCTAssertEqual(settings.normalized().workerContextTokens, 1024)
+        settings.workerContextTokens = 10_000_000
+        XCTAssertEqual(settings.normalized().workerContextTokens, 131_072)
+    }
+
     func testCachingAndCompactionDefaultsPreserveExplicitOptOuts() throws {
         for settings in [NativSettings(), try JSONDecoder().decode(NativSettings.self, from: Data("{}".utf8))] {
             XCTAssertTrue(settings.prefixCachingEnabled)

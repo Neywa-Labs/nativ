@@ -3004,6 +3004,7 @@ final class ChatViewModel: ObservableObject {
                         spawnAgentParentMessages: Array((sessionMessages(for: queuedRequest.sessionID) ?? []).prefix { $0.id != assistantMessageID }),
                         agentRegistry: agentRegistry(for: queuedRequest.sessionID)
                     )
+                    sharedContext.workerRouting = appModel?.workerRouting(for: activeSettings)
 
                     sharedContext.fileReadRootPath = queuedRequest.toolScope.isProject
                         ? queuedRequest.toolScope.fileReadRootPath : activeSettings.fileReadRootPath
@@ -3217,7 +3218,7 @@ final class ChatViewModel: ObservableObject {
                        worktree.availableRootPath != queuedRequest.toolScope.rootPath || worktree.availableRootPath == nil {
                         throw ChatGitWorktreeError(message: "The chat worktree is unavailable. Restore its folder before running tools.")
                     }
-                    let context = ChatToolExecutionContext(
+                    var context = ChatToolExecutionContext(
                         imageGenerationModelID: activeImageModelID,
                         baseURL: queuedRequest.settings.serverBaseURL,
                         apiKey: queuedRequest.settings.serverAPIKey,
@@ -3307,6 +3308,7 @@ final class ChatViewModel: ObservableObject {
                             }
                         }
                     )
+                    context.workerRouting = appModel?.workerRouting(for: activeSettings)
                     let outcome: ChatToolExecutionOutcome
                     if let customTool {
                         let result = try await CustomToolExecutor.execute(
@@ -3676,9 +3678,14 @@ final class ChatViewModel: ObservableObject {
         let definitions = ChatToolRegistry.definitions(canEditImage: canEditImage)
             + settings.customTools.compactMap { try? $0.definition() }
             + (mcpHost?.toolDefinitions(projectScope: scope) ?? [])
-        return definitions
+        let available = definitions
             .filter { toolIsAvailable($0.function.name, settings: settings, scope: scope) }
-            .sorted { $0.function.name < $1.function.name }
+        return ChatWorkerToolSchema.apply(
+            to: available,
+            enabled: settings.workerSubagentsEnabled,
+            categories: WorkerModelCatalog.bundled.categories
+        )
+        .sorted { $0.function.name < $1.function.name }
     }
 
     private func insertAssistantMessage(for queuedRequest: QueuedChatRequest) -> Bool {
