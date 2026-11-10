@@ -22,6 +22,20 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Check out mlx-vlm main
+        uses: actions/checkout@v4
+        with:
+          repository: Neywa-Labs/mlx-vlm
+          ref: main
+          path: .cache/mlx-vlm
+          persist-credentials: false
+
+      - name: Record mlx-vlm revision
+        id: mlx_vlm
+        run: |
+          mlx_vlm_sha="$(git -C .cache/mlx-vlm rev-parse HEAD)"
+          echo "sha=$mlx_vlm_sha" >> "$GITHUB_OUTPUT"
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
@@ -43,7 +57,7 @@ jobs:
           path: |
             ${{ env.XCODE_DERIVED_DATA }}/Build/Products/Debug/NativServerKit.framework/Versions/A/Resources/mlx-vlm-server
             .cache/python-build-standalone
-          key: mlx-vlm-server-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('PythonDistribution/**') }}
+          key: mlx-vlm-server-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('PythonDistribution/**') }}-${{ steps.mlx_vlm.outputs.sha }}
 
       - name: Cache Swift package dependencies
         uses: actions/cache@v4
@@ -54,6 +68,8 @@ jobs:
             spm-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Build app and run targeted regression tests (unsigned Debug)
+        env:
+          MLX_VLM_SOURCE_PATH: ${{ github.workspace }}/.cache/mlx-vlm
         run: |
           make xcode-generate
           xcodebuild -project Nativ.xcodeproj -scheme Nativ -configuration Debug \
