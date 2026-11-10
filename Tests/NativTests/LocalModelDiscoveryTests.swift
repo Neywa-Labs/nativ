@@ -101,6 +101,45 @@ final class LocalModelDiscoveryTests: XCTestCase {
         XCTAssertFalse(model.capabilities.contains(.text))
     }
 
+    func testDiscoversMiniMaxH3ImageAsGenerationAndEditingModel() async throws {
+        let repositories = [
+            ("MiniMaxAI/MiniMax-H3-Image", false),
+            ("mlx-community/MiniMax-H3-Image-4bit", true),
+        ]
+        for (repoID, converted) in repositories {
+            let snapshot = snapshotURL(repoID: repoID)
+            try writeJSON(
+                ["_class_name": "MiniMaxH3ImagePipeline"],
+                to: snapshot.appendingPathComponent("model_index.json")
+            )
+            let transformer = converted ? "transformer" : "transformer_diffusers"
+            let vae = converted ? "vae" : "vae_diffusers"
+            for component in [transformer, vae, "text_encoder"] {
+                try write("weights", to: snapshot.appendingPathComponent("\(component)/model.safetensors"))
+            }
+            try writeJSON(
+                ["_class_name": "MiniMaxH3ImageTransformer2DModel"],
+                to: snapshot.appendingPathComponent("\(transformer)/config.json"))
+            try writeJSON(
+                ["_class_name": "AutoencoderKLMiniMaxH3Image"],
+                to: snapshot.appendingPathComponent("\(vae)/config.json"))
+            try writeJSON(["model_type": "qwen3_vl"], to: snapshot.appendingPathComponent("text_encoder/config.json"))
+            try writeJSON([:], to: snapshot.appendingPathComponent("tokenizer/tokenizer.json"))
+        }
+
+        let models = try await LocalModelDiscovery.scan(searchPaths: searchPaths)
+        XCTAssertEqual(models.count, repositories.count)
+        for (repoID, _) in repositories {
+            let model = try XCTUnwrap(models.first { $0.repoID == repoID }, repoID)
+
+            XCTAssertEqual(model.provider, .miniMax)
+            XCTAssertTrue(model.capabilities.contains(.imageGeneration))
+            XCTAssertTrue(model.capabilities.contains(.imageEditing))
+            XCTAssertFalse(model.capabilities.contains(.text))
+            XCTAssertFalse(model.isEligibleForLanguageModelPicker)
+        }
+    }
+
     func testDiscoversMOSSImagePipelineAsGenerationOnlyModel() async throws {
         let repoID = "OpenMOSS-Team/MOSS-Image-SFT"
         let snapshot = snapshotURL(repoID: repoID)
