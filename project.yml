@@ -14,7 +14,7 @@ settings:
 packages:
   swift-xet:
     url: https://github.com/huggingface/swift-xet
-    exactVersion: 1.1.0
+    exactVersion: 1.1.1
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm
     exactVersion: 1.18.0

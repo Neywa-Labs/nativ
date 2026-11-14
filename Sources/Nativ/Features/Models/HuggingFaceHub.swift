@@ -2109,7 +2109,8 @@ final class HuggingFaceDownloadOperation: @unchecked Sendable {
         environment: [String: String],
         cachePath: String,
         capacity: HuggingFaceDownloadCapacity,
-        stallTimeout: TimeInterval = 60,
+        // Matches xet-core's read timeout; swift-xet retries a silent fetch well within it.
+        stallTimeout: TimeInterval = 300,
         progress: @escaping @Sendable (ModelDownloadProgress) -> Void = { _ in },
         transferSpeed: @escaping @Sendable (Double?) -> Void = { _ in },
         phase: @escaping @Sendable (HuggingFaceDownloadManager.DownloadPhase) -> Void = { _ in }
