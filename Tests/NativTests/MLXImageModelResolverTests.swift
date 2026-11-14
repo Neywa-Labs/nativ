@@ -11,6 +11,7 @@ final class MLXImageModelResolverTests: XCTestCase {
         "ideogram4",
         "llada_image",
         "mage_flow",
+        "minimax_h3_image",
         "moss_image",
         "qwen_image",
         "z_image",
@@ -21,6 +22,7 @@ final class MLXImageModelResolverTests: XCTestCase {
         "flux3",
         "llada_image",
         "mage_flow",
+        "minimax_h3_image",
         "qwen_image",
         "z_image",
     ]
@@ -199,6 +201,107 @@ final class MLXImageModelResolverTests: XCTestCase {
                 fileManager: .default
             )
         )
+    }
+
+    func testMiniMaxH3ImageResolvesOfficialAndConvertedLayouts() throws {
+        for converted in [false, true] {
+            try makeCompleteMiniMaxH3ImageFixture(converted: converted)
+            for model in [
+                "MiniMaxAI/MiniMax-H3-Image",
+                "mlx-community/MiniMax-H3-Image-4bit",
+                "local/renamed-checkpoint",
+            ] {
+                XCTAssertTrue(resolver().isImageGenerationModel(
+                    model: model, at: temporaryRoot, fileManager: .default), model)
+                XCTAssertTrue(resolver().isImageEditingModel(
+                    model: model, at: temporaryRoot, fileManager: .default), model)
+            }
+            try FileManager.default.removeItem(at: temporaryRoot)
+            try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
+        }
+    }
+
+    func testMiniMaxH3ImageModelTypeMetadataSupportsRenamedConversion() throws {
+        try makeCompleteMiniMaxH3ImageFixture(converted: true)
+        try writeJSON(["model_type": "minimax_h3_image"], to: "model_index.json")
+
+        XCTAssertTrue(resolver().isImageGenerationModel(
+            model: "local/custom-checkpoint", at: temporaryRoot, fileManager: .default))
+        XCTAssertTrue(resolver().isImageEditingModel(
+            model: "local/custom-checkpoint", at: temporaryRoot, fileManager: .default))
+    }
+
+    func testMiniMaxH3ImageRequiresCompleteComponentLayout() throws {
+        for converted in [false, true] {
+            let transformer = converted ? "transformer" : "transformer_diffusers"
+            let vae = converted ? "vae" : "vae_diffusers"
+            for missingFile in [
+                "model_index.json", "tokenizer/tokenizer.json",
+                "\(transformer)/config.json", "\(transformer)/model.safetensors",
+                "\(vae)/config.json", "\(vae)/model.safetensors",
+                "text_encoder/config.json", "text_encoder/model.safetensors",
+            ] {
+                try makeCompleteMiniMaxH3ImageFixture(converted: converted)
+                try FileManager.default.removeItem(at: temporaryRoot.appendingPathComponent(missingFile))
+
+                XCTAssertFalse(resolver().isSupportedImageModel(
+                    model: "MiniMaxAI/MiniMax-H3-Image", at: temporaryRoot, fileManager: .default),
+                    missingFile)
+            }
+            try FileManager.default.removeItem(at: temporaryRoot)
+            try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
+        }
+    }
+
+    func testMiniMaxH3ImageRejectsUnsupportedComponentFormats() throws {
+        for component in ["transformer", "vae"] {
+            try makeCompleteMiniMaxH3ImageFixture(converted: true)
+            try writeJSON(
+                ["_class_name": "UnsupportedNativeWeights"], to: "\(component)/config.json")
+
+            XCTAssertFalse(resolver().isSupportedImageModel(
+                model: "MiniMaxAI/MiniMax-H3-Image", at: temporaryRoot, fileManager: .default),
+                component)
+        }
+    }
+
+    func testMiniMaxH3ImageSupportsExternalTextEncoderReference() throws {
+        try makeCompleteMiniMaxH3ImageFixture()
+        try FileManager.default.removeItem(at: temporaryRoot.appendingPathComponent("text_encoder"))
+        try writeJSON([
+            "_class_name": "MiniMaxH3ImagePipeline",
+            "text_encoder": [
+                "transformers", "Qwen3VLForConditionalGeneration",
+                ["pretrained_model_name_or_path": "MiniMaxAI/MiniMax-H3", "subfolder": "text_encoder"],
+            ],
+        ], to: "model_index.json")
+
+        XCTAssertTrue(resolver().isImageGenerationModel(
+            model: "MiniMaxAI/MiniMax-H3-Image", at: temporaryRoot, fileManager: .default))
+        XCTAssertTrue(resolver().isImageEditingModel(
+            model: "MiniMaxAI/MiniMax-H3-Image", at: temporaryRoot, fileManager: .default))
+    }
+
+    func testMiniMaxH3VideoAndPromptExpanderAreNotImageModels() throws {
+        try writeJSON(["model_type": "qwen3_5"], to: "config.json")
+        try touch("model.safetensors")
+
+        for model in [
+            "MiniMaxAI/MiniMax-H3", "MiniMaxAI/MiniMax-H3-Image-PE",
+            "mlx-community/MiniMax-H3-Image-PE-4bit",
+        ] {
+            XCTAssertFalse(resolver().isSupportedImageModel(
+                model: model, at: temporaryRoot, fileManager: .default), model)
+        }
+    }
+
+    func testMiniMaxH3ImageIsGatedByBundledBackend() throws {
+        try makeCompleteMiniMaxH3ImageFixture()
+        let olderResolver = MLXImageModelResolver(
+            generationModelTypes: ["flux2"], editingModelTypes: ["flux2"])
+
+        XCTAssertFalse(olderResolver.isSupportedImageModel(
+            model: "MiniMaxAI/MiniMax-H3-Image", at: temporaryRoot, fileManager: .default))
     }
 
     func testMOSSImagePipelineResolvesToGenerationOnly() throws {
@@ -548,6 +651,25 @@ final class MLXImageModelResolverTests: XCTestCase {
         try writeJSON(["model_type": "qwen3_vl"], to: "text_encoder/config.json")
         try touch("text_encoder/model-00001-of-00001.safetensors")
         try touch("text_encoder/tokenizer.json")
+    }
+
+    private func makeCompleteMiniMaxH3ImageFixture(converted: Bool = false) throws {
+        var metadata = ["_class_name": "MiniMaxH3ImagePipeline"]
+        if converted {
+            metadata["model_type"] = "minimax_h3_image"
+            metadata["mlx_vlm_format"] = "minimax_h3_image"
+        }
+        try writeJSON(metadata, to: "model_index.json")
+        try touch("tokenizer/tokenizer.json")
+        let transformer = converted ? "transformer" : "transformer_diffusers"
+        let vae = converted ? "vae" : "vae_diffusers"
+        try writeJSON(
+            ["_class_name": "MiniMaxH3ImageTransformer2DModel"], to: "\(transformer)/config.json")
+        try writeJSON(["_class_name": "AutoencoderKLMiniMaxH3Image"], to: "\(vae)/config.json")
+        try writeJSON(["model_type": "qwen3_vl"], to: "text_encoder/config.json")
+        for component in [transformer, vae, "text_encoder"] {
+            try touch("\(component)/model.safetensors")
+        }
     }
 
     private func makeCompleteMOSSImageFixture() throws {

@@ -283,6 +283,10 @@ enum ChatImageModelSelection {
             "flux3"
         } else if name.contains("flux2") || name.contains("flux_2") || name.contains("flux.2") {
             "flux2"
+        } else if name == "minimax_h3_image"
+            || (name.hasPrefix("minimax_h3_image_")
+                && name != "minimax_h3_image_pe" && !name.hasPrefix("minimax_h3_image_pe_")) {
+            "minimax_h3_image"
         } else if name == "moss_image" || name.hasPrefix("moss_image_") {
             "moss_image"
         } else if name.contains("bonsai") {
@@ -297,7 +301,7 @@ enum ChatImageModelSelection {
         guard let family, supportedDownloadableModelFamilies.contains(family) else {
             return []
         }
-        if family == "flux2" || family == "flux3" {
+        if ["flux2", "flux3", "minimax_h3_image"].contains(family) {
             return [.imageGeneration, .imageEditing]
         }
         if family == "mage_flow", MLXImageModelResolver.isKnownImageEditOnlyModelID(modelID) {

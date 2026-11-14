@@ -6,12 +6,12 @@ struct MLXImageModelResolver: Sendable {
         generationModelTypes: (try? Nativ.imageGenerationModelTypes())
             ?? [
                 "bonsai", "ernie_image", "flux2", "flux3", "ideogram4",
-                "llada_image", "mage_flow", "moss_image", "qwen_image", "z_image",
+                "llada_image", "mage_flow", "minimax_h3_image", "moss_image", "qwen_image", "z_image",
             ],
         editingModelTypes: (try? Nativ.imageEditingModelTypes())
             ?? [
                 "ernie_image", "flux2", "flux3", "llada_image", "mage_flow",
-                "qwen_image", "z_image",
+                "minimax_h3_image", "qwen_image", "z_image",
             ]
     )
 
@@ -215,6 +215,13 @@ struct MLXImageModelResolver: Sendable {
             return
         }
         let className = String(describing: value)
+        // MiniMax's mixed-case name splits into Mini_Max rather than minimax.
+        if [
+            "MiniMaxH3ImagePipeline", "MiniMaxH3ImageTransformer2DModel",
+            "AutoencoderKLMiniMaxH3Image",
+        ].contains(className) {
+            addModelType("minimax_h3_image", to: &candidates)
+        }
         let range = NSRange(className.startIndex..., in: className)
         let tokens = Self.pascalCaseTokenRegex.matches(
             in: className,
@@ -269,6 +276,11 @@ struct MLXImageModelResolver: Sendable {
 
     private func modelType(from model: String) -> String? {
         guard let normalizedName = Self.normalizedModelName(model) else {
+            return nil
+        }
+        if normalizedName == "minimax_h3_image_pe"
+            || normalizedName.hasPrefix("minimax_h3_image_pe_")
+        {
             return nil
         }
         if normalizedName.hasPrefix("flux_3_")
@@ -427,6 +439,52 @@ struct MLXImageModelResolver: Sendable {
                     at: root,
                     fileManager: fileManager
                 )
+        case "minimax_h3_image":
+            guard let metadata = loadJSONObject(
+                at: root.appendingPathComponent("model_index.json"),
+                fileManager: fileManager
+            ),
+                metadata["_class_name"] as? String == "MiniMaxH3ImagePipeline"
+                    || metadata["model_type"] as? String == "minimax_h3_image"
+            else {
+                return false
+            }
+            let hasTextEncoder: Bool
+            if fileManager.fileExists(
+                atPath: root.appendingPathComponent("text_encoder/config.json").path
+            ) {
+                hasTextEncoder = hasSafetensors(in: "text_encoder", at: root, fileManager: fileManager)
+            } else {
+                // Official packages may reference a shared conditioner in another Hub repo.
+                let entry = metadata["text_encoder"] as? [Any]
+                let reference = entry?.dropFirst(2).first as? [String: Any]
+                let repository = reference?["pretrained_model_name_or_path"] as? String
+                let subfolder = reference?["subfolder"] as? String ?? "text_encoder"
+                hasTextEncoder = repository?.isEmpty == false && subfolder == "text_encoder"
+            }
+            return hasTextEncoder
+                && ["tokenizer", "conditioner", "text_encoder"].contains {
+                    fileManager.fileExists(
+                        atPath: root.appendingPathComponent("\($0)/tokenizer.json").path
+                    )
+                }
+                && ["transformer", "vae"].allSatisfy { component in
+                    // Match mlx-vlm's preference for the official Diffusers weights.
+                    let directory = fileManager.fileExists(
+                        atPath: root.appendingPathComponent("\(component)_diffusers/config.json").path
+                    ) ? "\(component)_diffusers" : component
+                    guard let config = loadJSONObject(
+                        at: root.appendingPathComponent("\(directory)/config.json"),
+                        fileManager: fileManager
+                    ) else {
+                        return false
+                    }
+                    let classNames = component == "transformer"
+                        ? ["MiniMaxH3ImageTransformer2DModel", "MiniMaxH3ImageTransformer"]
+                        : ["AutoencoderKLMiniMaxH3Image"]
+                    return classNames.contains(config["_class_name"] as? String ?? "")
+                        && hasSafetensors(in: directory, at: root, fileManager: fileManager)
+                }
         case "moss_image":
             guard
                 let metadata = loadJSONObject(

@@ -487,6 +487,37 @@ final class ChatToolRegistryTests: XCTestCase {
         }
     }
 
+    func testRecommendationsRecognizeMiniMaxH3ImageGenerationAndEditing() {
+        for modelID in [
+            "MiniMaxAI/MiniMax-H3-Image",
+            "mlx-community/MiniMax-H3-Image-bf16",
+            "mlx-community/MiniMax-H3-Image-4bit",
+        ] {
+            XCTAssertEqual(
+                ChatImageModelSelection.downloadableCapabilities(modelID: modelID, tags: []),
+                [.imageGeneration, .imageEditing],
+                modelID
+            )
+        }
+    }
+
+    func testRecommendationsRejectMiniMaxH3VideoPromptExpanderAndAdapters() {
+        for modelID in [
+            "MiniMaxAI/MiniMax-H3",
+            "MiniMaxAI/MiniMax-H3-Image-PE",
+            "mlx-community/MiniMax-H3-Image-PE-4bit",
+            "org/MiniMax-H3-Image-LoRA",
+        ] {
+            XCTAssertEqual(
+                ChatImageModelSelection.downloadableCapabilities(modelID: modelID, tags: []),
+                [],
+                modelID
+            )
+        }
+        XCTAssertEqual(ChatImageModelSelection.downloadableCapabilities(
+            modelID: "MiniMaxAI/MiniMax-H3-Image", tags: ["adapter"]), [])
+    }
+
     func testRecommendationsRejectUnsupportedFlux3ExportsAndMOSSAdapters() {
         for modelID in [
             "black-forest-labs/flux-3-image-klein-comfy",
