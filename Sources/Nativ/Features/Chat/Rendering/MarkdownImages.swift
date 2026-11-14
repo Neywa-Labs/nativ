@@ -11,7 +11,7 @@ struct MarkdownImageRequest: Hashable {
             for node in nodes {
                 if node.kind == "image",
                     let url = URL(string: node.destination, relativeTo: baseURL)?.absoluteURL,
-                    ["https", "http", "file"].contains(url.scheme?.lowercased() ?? "")
+                    ["https", "http", "file", "data"].contains(url.scheme?.lowercased() ?? "")
                 {
                     urls.insert(url)
                 }
@@ -142,12 +142,13 @@ extension NSAttributedString.Key {
 
 actor MarkdownImageLoader {
     static let shared = MarkdownImageLoader()
+    private static let maximumDataSize = 24 * 1024 * 1024
     private let session: URLSession
     private let cache = NSCache<NSURL, NSData>()
 
     init(session: URLSession = .shared) {
         self.session = session
-        cache.totalCostLimit = 24 * 1024 * 1024
+        cache.totalCostLimit = Self.maximumDataSize
         cache.countLimit = 128
     }
 
@@ -155,7 +156,17 @@ actor MarkdownImageLoader {
         try Task.checkCancellation()
         if let data = cache.object(forKey: url as NSURL) { return data as Data }
         let data: Data
-        if url.isFileURL {
+        if url.scheme?.lowercased() == "data" {
+            guard url.absoluteString.lowercased().hasPrefix("data:image/") else {
+                throw URLError(.unsupportedURL)
+            }
+            // A percent-encoded byte takes at most three characters. Bound the
+            // encoded input before Foundation decodes either percent or base64 data.
+            guard url.absoluteString.utf8.count <= Self.maximumDataSize * 3 + 1024 else {
+                throw URLError(.dataLengthExceedsMaximum)
+            }
+            data = try Data(contentsOf: url)
+        } else if url.isFileURL {
             data = try await Task.detached(priority: .utility) {
                 try Data(contentsOf: url, options: .mappedIfSafe)
             }.value
@@ -172,7 +183,7 @@ actor MarkdownImageLoader {
             }
         }
         try Task.checkCancellation()
-        guard data.count <= 24 * 1024 * 1024 else { throw URLError(.dataLengthExceedsMaximum) }
+        guard data.count <= Self.maximumDataSize else { throw URLError(.dataLengthExceedsMaximum) }
         cache.setObject(data as NSData, forKey: url as NSURL, cost: data.count)
         return data
     }

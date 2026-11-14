@@ -415,9 +415,12 @@ enum MarkdownLayouter {
                         result.append(NSAttributedString(string: literal, attributes: attrs))
                     } else {
                         let alt = imageLabel(node.children)
-                        let label = alt.isEmpty ? node.destination : alt
                         let url = URL(string: node.destination, relativeTo: style.baseURL)?
                             .absoluteURL
+                        // Embedded bytes are not a readable fallback while an image
+                        // loads or when it cannot be decoded.
+                        let fallback = url?.scheme?.lowercased() == "data" ? "Image" : node.destination
+                        let label = alt.isEmpty ? fallback : alt
                         var imageAttrs = attrs
                         if let url { imageAttrs[.link] = url }
                         if let url,

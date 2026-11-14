@@ -338,6 +338,85 @@ private final class MarkdownTestFlippedView: NSView {
 
 @MainActor
 final class MarkdownDocumentImageTests: XCTestCase {
+    func testModelCardEmbeddedSVGNavigationRendersAsLinkedImages() async throws {
+        // LiquidAI/LFM3-1.7B uses partially escaped SVG data URLs with spaces,
+        // CSS media queries, and parentheses inside HTML navigation links.
+        let source = """
+        <div align="center">
+        <a href="https://console.liquid.ai/dashboard"><img src="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2216%22 height=%2216%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke-width=%222.2%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cstyle%3Epath%7Bstroke:%23000%7D%40media (prefers-color-scheme:dark)%7Bpath%7Bstroke:%23d1d5dc%7D%7D%3C/style%3E%3Cpath d=%22m8 6-6 6 6 6m8-12 6 6-6 6m-2-14-4 16%22/%3E%3C/svg%3E" alt=""><strong>API</strong></a>
+        </div>
+        """
+        let markdown = HuggingFaceModelReadmeFormatting.displayMarkdown(source)
+        let request = MarkdownImageRequest(markdown: markdown, baseURL: nil)
+        XCTAssertEqual(request.urls.count, 1)
+        let images = await MarkdownImages.load(request)
+        XCTAssertEqual(images.values.count, 1)
+        XCTAssertEqual(images.values.first?.value.size, CGSize(width: 16, height: 16))
+
+        for dark in [false, true] {
+            for width: CGFloat in [260, 600] {
+                let layout = MarkdownLayouter.layout(
+                    markdown, width: width, style: .init(dark: dark, images: images))
+                let text = try XCTUnwrap(layout.blocks.first?.text.first?.text)
+                XCTAssertNotNil(text.attribute(.attachment, at: 0, effectiveRange: nil))
+                XCTAssertEqual(MarkdownSelectableTextView.plainText(text), "ImageAPI")
+                for index in 0..<text.length {
+                    XCTAssertEqual(
+                        text.attribute(.link, at: index, effectiveRange: nil) as? URL,
+                        URL(string: "https://console.liquid.ai/dashboard"))
+                }
+                XCTAssertLessThan(layout.size.height, 60)
+            }
+        }
+    }
+
+    func testEmbeddedRasterImagesDecodeBase64AndPercentEncodedBytes() async throws {
+        let png = try diagramPNG()
+        let percentEncoded = png.map { String(format: "%%%02X", $0) }.joined()
+        let request = MarkdownImageRequest(
+            markdown: "![Base64](data:image/png;base64,\(png.base64EncodedString())) ![Percent](data:image/png,\(percentEncoded))",
+            baseURL: nil)
+        let loader = MarkdownImageLoader()
+        XCTAssertEqual(request.urls.count, 2)
+        for url in request.urls {
+            let data = try await loader.data(for: url)
+            XCTAssertEqual(data, png)
+        }
+        let images = await MarkdownImages.load(request, loader: loader)
+        XCTAssertEqual(images.values.count, 2)
+        XCTAssertTrue(images.values.values.allSatisfy { $0.size == CGSize(width: 640, height: 320) })
+    }
+
+    func testPendingAndInvalidEmbeddedImagesNeverExposeTheirPayloads() async throws {
+        let markdown = "[![](data:image/png;base64,invalid)API](https://example.com) ![Diagram](data:image/png,invalid)"
+        let images = await MarkdownImages.load(.init(markdown: markdown, baseURL: nil))
+        XCTAssertTrue(images.values.isEmpty)
+        for resources in [MarkdownImages.empty, images] {
+            let layout = MarkdownLayouter.layout(markdown, width: 260, style: .init(images: resources))
+            let text = try XCTUnwrap(layout.blocks.first?.text.first?.text)
+            XCTAssertEqual(MarkdownSelectableTextView.plainText(text), "ImageAPI Diagram")
+            XCTAssertEqual(
+                text.attribute(.link, at: 0, effectiveRange: nil) as? URL,
+                URL(string: "https://example.com"))
+        }
+    }
+
+    func testEmbeddedImageLoaderRejectsNonImageDataAndOversizedImages() async throws {
+        let loader = MarkdownImageLoader()
+        let cases: [(String, URLError.Code)] = [
+            ("data:text/html,%3Cb%3Ehello%3C/b%3E", .unsupportedURL),
+            ("data:image/png," + String(repeating: "a", count: 24 * 1024 * 1024 + 1), .dataLengthExceedsMaximum),
+        ]
+        for (source, expected) in cases {
+            do {
+                _ = try await loader.data(for: XCTUnwrap(URL(string: source)))
+                XCTFail("Expected embedded image rejection")
+            } catch let error as URLError {
+                XCTAssertEqual(error.code, expected)
+            }
+        }
+    }
+
     func testRelativeReferencesExcludeCodeAndMath() throws {
         let request = MarkdownImageRequest(
             markdown:
