@@ -253,8 +253,11 @@ enum HuggingFaceModelReadmeFormatting {
             guard let sourceURL = htmlAttribute("src", in: tag), !sourceURL.isEmpty else {
                 return ""
             }
-            let alt = htmlAttribute("alt", in: tag) ?? ""
-            return "![\(decodeHTMLEntities(alt))](\(decodeHTMLEntities(sourceURL)))"
+            let alt = decodeHTMLEntities(htmlAttribute("alt", in: tag) ?? "")
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "[", with: "\\[")
+                .replacingOccurrences(of: "]", with: "\\]")
+            return "![\(alt)](\(markdownDestination(sourceURL)))"
         }
         output = replacingMatches(in: output, pattern: "<a\\b([^>]*)>(.*?)</a\\s*>") {
             match, source in
@@ -270,7 +273,7 @@ enum HuggingFaceModelReadmeFormatting {
             guard let url = htmlAttribute("href", in: attributes), !url.isEmpty else {
                 return label
             }
-            return "[\(decodeHTMLEntities(label))](\(decodeHTMLEntities(url)))"
+            return "[\(decodeHTMLEntities(label))](\(markdownDestination(url)))"
         }
 
         for level in 1...6 {
@@ -286,8 +289,8 @@ enum HuggingFaceModelReadmeFormatting {
         }
 
         let literalReplacements: [(String, String)] = [
-            ("<br\\s*/?>", "  \n"),
-            ("<hr\\s*/?>", "\n\n---\n\n"),
+            ("<br\\b[^>]*>", "\\\\\n"),
+            ("<hr\\b[^>]*>", "\n\n---\n\n"),
             ("<(b|strong)\\b[^>]*>", "**"),
             ("</(b|strong)\\s*>", "**"),
             ("<(i|em)\\b[^>]*>", "*"),
@@ -414,6 +417,7 @@ enum HuggingFaceModelReadmeFormatting {
     private static func normalizedHTMLTableCell(_ html: String) -> String {
         normalizeHTMLFragment(html)
             .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\\\n", with: " ")
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(
@@ -477,6 +481,16 @@ enum HuggingFaceModelReadmeFormatting {
             return source.substring(with: match.range(at: index))
         }
         return nil
+    }
+
+    /// HTML attributes may contain spaces and unmatched parentheses, especially in
+    /// SVG data URLs. Encode Markdown delimiters without double-encoding existing escapes.
+    private static func markdownDestination(_ attribute: String) -> String {
+        let allowed = CharacterSet.urlFragmentAllowed
+            .union(CharacterSet(charactersIn: "%#[]"))
+            .subtracting(CharacterSet(charactersIn: "()\\"))
+        let decoded = decodeHTMLEntities(attribute)
+        return decoded.addingPercentEncoding(withAllowedCharacters: allowed) ?? decoded
     }
 
     private static func decodeHTMLEntities(_ text: String) -> String {

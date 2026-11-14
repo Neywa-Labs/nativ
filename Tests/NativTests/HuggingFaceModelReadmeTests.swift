@@ -64,6 +64,39 @@ final class HuggingFaceModelReadmeTests: XCTestCase {
         )
     }
 
+    func testHTMLImageAndLinkDestinationsPreserveEscapesAndEncodeMarkdownDelimiters() throws {
+        let markdown = #"<a href="docs/model (draft.html?x=1&amp;y=2#usage"><img src="assets/model (draft%20v2.png" alt="Model [preview]"></a>"#
+        let output = HuggingFaceModelReadmeFormatting.displayMarkdown(markdown)
+        let link = try XCTUnwrap(MarkdownParser.parse(output).first?.children.first)
+        XCTAssertEqual(link.kind, "link")
+        XCTAssertEqual(link.destination, "docs/model%20%28draft.html?x=1&y=2#usage")
+        let image = try XCTUnwrap(link.children.first)
+        XCTAssertEqual(image.kind, "image")
+        XCTAssertEqual(image.destination, "assets/model%20%28draft%20v2.png")
+        XCTAssertEqual(image.children.first?.literal, "Model [preview]")
+    }
+
+    func testStyledHTMLSeparatorsDoNotExposeTags() {
+        let markdown = """
+        # Model details
+        <hr style="margin: -0.7em 0 1.2em 0; border-top: 1px solid gray;" />
+        First line<br class="break" />Second line
+        """
+        let output = HuggingFaceModelReadmeFormatting.displayMarkdown(markdown)
+        XCTAssertFalse(output.contains("<hr"))
+        XCTAssertFalse(output.contains("<br"))
+        let nodes = MarkdownParser.parse(output)
+        XCTAssertEqual(nodes.map(\.kind), ["heading", "thematic_break", "paragraph"])
+        XCTAssertEqual(nodes.last?.children.map(\.kind), ["text", "linebreak", "text"])
+    }
+
+    func testHTMLTableLineBreaksKeepReadableCellText() {
+        let markdown = "<table><tr><td>First<br style=\"clear: both\">Second</td></tr></table>"
+        XCTAssertEqual(
+            HuggingFaceModelReadmeFormatting.displayMarkdown(markdown),
+            "| First Second |\n| --- |")
+    }
+
     func testDisplayMarkdownConvertsHTMLTableIntoCompleteMarkdownRows() {
         let markdown = """
         <table>
