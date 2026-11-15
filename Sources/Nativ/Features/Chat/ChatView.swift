@@ -1830,9 +1830,7 @@ private struct ChatIntermediateAssistantContent: View {
                 ChatResponseMetricsRow(metrics: responseMetrics)
             }
         }
-        .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 
