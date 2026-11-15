@@ -68,23 +68,30 @@ struct ChatAgentTurnPresentation: Identifiable, Equatable {
     }
 
     var finalAssistantMessage: ChatTranscriptMessage? {
-        assistantMessages.last(where: { $0.toolCalls.isEmpty })
+        guard let message = messages.last,
+              message.role == .assistant,
+              message.toolCalls.isEmpty else {
+            return nil
+        }
+        return message
     }
 
     var modelID: String? {
         finalAssistantMessage?.modelID ?? assistantMessages.last?.modelID
     }
 
-    var reasoningContent: String {
-        assistantMessages
-            .map(\.reasoningContent)
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n\n")
+    /// Keep each assistant step (including reasoning-only steps) beside its tools.
+    /// The trailing response is rendered separately, with its own reasoning.
+    var activityMessages: [ChatTranscriptMessage] {
+        if finalAssistantMessage != nil {
+            return Array(messages.dropLast())
+        }
+        return messages
     }
 
     var thinkingDuration: TimeInterval? {
-        let durations = assistantMessages.compactMap { message -> TimeInterval? in
-            guard !message.reasoningContent.isEmpty else {
+        let durations = activityMessages.compactMap { message -> TimeInterval? in
+            guard message.role == .assistant, !message.reasoningContent.isEmpty else {
                 return nil
             }
             return message.thinkingDuration
@@ -95,28 +102,24 @@ struct ChatAgentTurnPresentation: Identifiable, Equatable {
         return durations.reduce(0, +)
     }
 
-    var isThinking: Bool {
-        assistantMessages.contains { message in
-            message.isStreaming
-                && message.content.isEmpty
-                && message.streamingToolCalls.isEmpty
-                && (message.isThinkingEnabled || !message.reasoningContent.isEmpty)
-        }
-    }
-
     var isAssistantStreaming: Bool {
         assistantMessages.contains(where: \.isStreaming)
     }
 
-    var intermediateAssistantMessages: [ChatTranscriptMessage] {
-        let finalID = finalAssistantMessage?.id
-        return assistantMessages.filter { message in
-            message.id != finalID && !message.content.isEmpty
-        }
-    }
-
     var toolUsage: ChatToolUsageSummary {
         ChatToolUsageSummary(messages: toolMessages)
+    }
+}
+
+extension ChatTranscriptMessage {
+    var isThinking: Bool {
+        role == .assistant && isStreaming && content.isEmpty
+            && streamingToolCalls.isEmpty
+            && (isThinkingEnabled || !reasoningContent.isEmpty)
+    }
+
+    var showsThinkingBubble: Bool {
+        role == .assistant && (!reasoningContent.isEmpty || isThinking)
     }
 }
 

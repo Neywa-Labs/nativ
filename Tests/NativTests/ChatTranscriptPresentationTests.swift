@@ -4,7 +4,7 @@ import XCTest
 @testable import NativServerKit
 
 final class ChatTranscriptPresentationTests: XCTestCase {
-    func testToolTurnCoalescesToolsAndSumsReasoningDuration() throws {
+    func testToolTurnKeepsReasoningInterleavedWithTools() throws {
         let user = ChatTranscriptMessage(role: .user, content: "Investigate this")
         let firstAssistant = assistantCalling(
             id: "read-1",
@@ -68,14 +68,15 @@ final class ChatTranscriptPresentationTests: XCTestCase {
         XCTAssertEqual(turn.id, firstAssistant.id)
         XCTAssertEqual(turn.finalAssistantMessage?.id, finalAssistant.id)
         XCTAssertEqual(try XCTUnwrap(turn.thinkingDuration), 10, accuracy: 0.001)
+        XCTAssertEqual(turn.activityMessages, [
+            firstAssistant, firstRead,
+            secondAssistant, secondRead,
+            commandAssistant, command,
+            searchAssistant, search,
+        ])
         XCTAssertEqual(
-            turn.reasoningContent,
-            [
-                firstAssistant.reasoningContent,
-                secondAssistant.reasoningContent,
-                commandAssistant.reasoningContent,
-                searchAssistant.reasoningContent,
-            ].joined(separator: "\n\n")
+            turn.activityMessages.filter(\.showsThinkingBubble).map(\.thinkingDuration),
+            [1, 2, 3, 4]
         )
         XCTAssertEqual(turn.toolUsage.groups.count, 3)
         XCTAssertEqual(
@@ -89,11 +90,103 @@ final class ChatTranscriptPresentationTests: XCTestCase {
         message.streamingToolCalls = [.init(index: 0, id: "pending", function: .init(name: "write_file", arguments: #"{"content":"partial"#))]
         let turn = ChatAgentTurnPresentation(messages: [message])
         XCTAssertEqual(turn.finalAssistantMessage?.id, message.id)
-        XCTAssertFalse(turn.isThinking)
+        XCTAssertFalse(message.isThinking)
         XCTAssertTrue(message.toolCalls.isEmpty)
         let restored = try JSONDecoder().decode(ChatTranscriptMessage.self, from: JSONEncoder().encode(message))
         XCTAssertTrue(restored.streamingToolCalls.isEmpty)
         XCTAssertTrue(restored.toolCalls.isEmpty)
+    }
+
+    func testSavedTurnKeepsReasoningOnlyStepsAndConsecutiveToolsInOrder() throws {
+        let first = assistantCalling(
+            id: "read-1", toolName: ChatReadFileToolRegistry.toolName,
+            reasoning: "Inspect the file.", duration: 1
+        )
+        let read = toolResult(id: "read-1", toolName: ChatReadFileToolRegistry.toolName)
+        var second = assistantCalling(
+            id: "read-2", toolName: ChatReadFileToolRegistry.toolName,
+            reasoning: "Read another file, then verify it.", duration: 2
+        )
+        second.toolCalls.append(call(id: "terminal-1", toolName: ChatTerminalToolRegistry.toolName))
+        let secondRead = toolResult(id: "read-2", toolName: ChatReadFileToolRegistry.toolName)
+        let command = toolResult(id: "terminal-1", toolName: ChatTerminalToolRegistry.toolName)
+        let final = ChatTranscriptMessage(
+            role: .assistant, content: "Verified.", reasoningContent: "The results agree.",
+            thinkingDuration: 3
+        )
+        let history = [first, read, second, secondRead, command, final]
+        let restored = try JSONDecoder().decode(
+            [ChatTranscriptMessage].self, from: JSONEncoder().encode(history)
+        )
+        let items = ChatTranscriptPresentation.items(from: restored)
+        guard case .agentTurn(let turn) = try XCTUnwrap(items.first) else {
+            return XCTFail("Expected a grouped tool turn after loading history")
+        }
+
+        XCTAssertEqual(turn.activityMessages.map(\.id), [first, read, second, secondRead, command].map(\.id))
+        XCTAssertEqual(
+            turn.activityMessages.filter(\.showsThinkingBubble).map(\.reasoningContent),
+            [first.reasoningContent, second.reasoningContent]
+        )
+        XCTAssertEqual(turn.finalAssistantMessage?.reasoningContent, final.reasoningContent)
+        XCTAssertEqual(try XCTUnwrap(turn.thinkingDuration), 3, accuracy: 0.001)
+    }
+
+    func testNewThinkingStepStaysAfterEarlierToolsDuringStreaming() throws {
+        let first = assistantCalling(
+            id: "read-1", toolName: ChatReadFileToolRegistry.toolName,
+            reasoning: "Inspect the file.", duration: 1
+        )
+        let read = toolResult(id: "read-1", toolName: ChatReadFileToolRegistry.toolName)
+        var next = ChatTranscriptMessage(
+            role: .assistant, content: "", isStreaming: true, isThinkingEnabled: true
+        )
+
+        for reasoning in ["", "Now verify the result."] {
+            next.reasoningContent = reasoning
+            let turn = ChatAgentTurnPresentation(messages: [first, read, next])
+            XCTAssertEqual(turn.activityMessages, [first, read])
+            let current = try XCTUnwrap(turn.finalAssistantMessage)
+            XCTAssertEqual(current.id, next.id)
+            XCTAssertTrue(current.isThinking)
+            XCTAssertTrue(current.showsThinkingBubble)
+        }
+
+        next.streamingToolCalls = [call(id: "terminal-1", toolName: ChatTerminalToolRegistry.toolName)]
+        XCTAssertFalse(next.isThinking)
+        XCTAssertTrue(next.showsThinkingBubble)
+        XCTAssertEqual(
+            ChatAgentTurnPresentation(messages: [first, read, next]).finalAssistantMessage?.streamingToolCalls,
+            next.streamingToolCalls
+        )
+
+        next.toolCalls = next.streamingToolCalls
+        next.streamingToolCalls = []
+        next.isStreaming = false
+        let command = toolResult(
+            id: "terminal-1", toolName: ChatTerminalToolRegistry.toolName,
+            status: .awaitingConsent
+        )
+        let executing = ChatAgentTurnPresentation(messages: [first, read, next, command])
+        XCTAssertNil(executing.finalAssistantMessage)
+        XCTAssertEqual(executing.activityMessages, [first, read, next, command])
+        XCTAssertTrue(executing.toolUsage.requiresInteraction)
+    }
+
+    func testEarlierAssistantWithoutToolCallsIsNotMovedAfterLaterTools() {
+        let commentary = ChatTranscriptMessage(role: .assistant, content: "Let me inspect that.")
+        let calling = assistantCalling(
+            id: "read-1", toolName: ChatReadFileToolRegistry.toolName,
+            reasoning: "Inspect the file.", duration: 1
+        )
+        let result = toolResult(
+            id: "read-1", toolName: ChatReadFileToolRegistry.toolName, status: .failed
+        )
+        let turn = ChatAgentTurnPresentation(messages: [commentary, calling, result])
+
+        XCTAssertNil(turn.finalAssistantMessage)
+        XCTAssertEqual(turn.activityMessages, [commentary, calling, result])
+        XCTAssertTrue(turn.toolUsage.hasFailure)
     }
 
     func testResponseWithoutToolsKeepsIndividualMessageRows() {

@@ -1225,7 +1225,7 @@ private struct ChatMessageRow: View, @MainActor Equatable {
                 if displaysThinkingBubble {
                     ChatThinkingBubble(
                         content: message.reasoningContent,
-                        isThinking: message.isStreaming && message.content.isEmpty && message.streamingToolCalls.isEmpty,
+                        isThinking: message.isThinking,
                         isStreaming: message.isStreaming,
                         thinkingDuration: message.thinkingDuration
                     )
@@ -1437,11 +1437,7 @@ private struct ChatMessageRow: View, @MainActor Equatable {
     }
 
     private var hasThinkingContent: Bool {
-        guard message.role == .assistant else {
-            return false
-        }
-        return !message.reasoningContent.isEmpty
-            || (message.isThinkingEnabled && message.isStreaming && message.content.isEmpty && message.streamingToolCalls.isEmpty)
+        message.showsThinkingBubble
     }
 
     private var rendersMarkdown: Bool {
@@ -1638,15 +1634,6 @@ private struct ChatAgentTurnRow: View {
                 ChatCompactionNotice(message: message)
             }
 
-            if showsThinkingBubble {
-                ChatThinkingBubble(
-                    content: turn.reasoningContent,
-                    isThinking: turn.isThinking,
-                    isStreaming: turn.isAssistantStreaming,
-                    thinkingDuration: turn.thinkingDuration
-                )
-            }
-
             if !turn.toolMessages.isEmpty {
                 ChatToolUsageSummaryRow(
                     turn: turn,
@@ -1687,8 +1674,7 @@ private struct ChatAgentTurnRow: View {
                     onCancelImageModelSelection: onCancelImageModelSelection,
                     onExploreImageModels: onExploreImageModels,
                     onPreviewAttachment: onPreviewAttachment,
-                    displaysModelTitle: false,
-                    displaysThinking: false
+                    displaysModelTitle: false
                 )
                 .equatable()
                 .id(finalAssistantMessage.id)
@@ -1702,16 +1688,13 @@ private struct ChatAgentTurnRow: View {
             ?? "Assistant"
     }
 
-    private var showsThinkingBubble: Bool {
-        !turn.reasoningContent.isEmpty || turn.isThinking
-    }
-
     private var toolMessagesWithAttachments: [ChatTranscriptMessage] {
         turn.toolMessages.filter { !$0.imageAttachments.isEmpty }
     }
 
     private func shouldRender(_ message: ChatTranscriptMessage) -> Bool {
         message.isCompacting || message.compactionMetrics != nil
+            || message.showsThinkingBubble
             || !message.streamingToolCalls.isEmpty
             || !message.content.isEmpty
             || !message.imageAttachments.isEmpty
@@ -1745,22 +1728,35 @@ private struct ChatToolUsageSummaryRow: View {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     statusIcon
 
-                    Text(summary.text)
-                        .font(.callout)
-                        .foregroundStyle(summaryColor)
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(summary.text)
+                            .font(.callout)
+                            .foregroundStyle(summaryColor)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        if let duration = turn.thinkingDuration {
+                            Text("Worked for \(NativFormatting.elapsedDuration(duration))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
 
                     Spacer(minLength: 8)
+
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded || summary.requiresInteraction ? 90 : 0))
                 }
                 .contentShape(.rect)
             }
             .buttonStyle(.plain)
-            .help(isExpanded ? "Hide tool details" : "Show tool details")
+            .help(isExpanded ? "Hide activity details" : "Show thinking and tool activity")
 
             if isExpanded || summary.requiresInteraction {
                 VStack(alignment: .leading, spacing: 6) {
-                    ForEach(detailMessages) { message in
+                    ForEach(turn.activityMessages) { message in
                         if message.role == .tool {
                             ChatAgentStepCell(
                                 message: message,
@@ -1773,8 +1769,18 @@ private struct ChatToolUsageSummaryRow: View {
                                 onCancelImageModelSelection: onCancelImageModelSelection,
                                 onExploreImageModels: onExploreImageModels
                             )
-                        } else if !message.content.isEmpty {
-                            ChatIntermediateAssistantContent(message: message)
+                        } else if message.role == .assistant {
+                            if message.showsThinkingBubble {
+                                ChatThinkingBubble(
+                                    content: message.reasoningContent,
+                                    isThinking: message.isThinking,
+                                    isStreaming: message.isStreaming,
+                                    thinkingDuration: message.thinkingDuration
+                                )
+                            }
+                            if !message.content.isEmpty {
+                                ChatIntermediateAssistantContent(message: message)
+                            }
                         }
                     }
                 }
@@ -1785,15 +1791,6 @@ private struct ChatToolUsageSummaryRow: View {
         .padding(.bottom, 2)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(summary.text)
-    }
-
-    private var detailMessages: [ChatTranscriptMessage] {
-        let finalAssistantID = turn.finalAssistantMessage?.id
-        return turn.messages.filter { message in
-            message.id != finalAssistantID
-                && (message.role == .tool
-                    || (message.role == .assistant && !message.content.isEmpty))
-        }
     }
 
     @ViewBuilder
