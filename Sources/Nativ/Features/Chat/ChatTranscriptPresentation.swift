@@ -70,7 +70,8 @@ struct ChatAgentTurnPresentation: Identifiable, Equatable {
     var finalAssistantMessage: ChatTranscriptMessage? {
         guard let message = messages.last,
               message.role == .assistant,
-              message.toolCalls.isEmpty else {
+              message.toolCalls.isEmpty,
+              message.streamingToolCalls.isEmpty else {
             return nil
         }
         return message
@@ -81,12 +82,15 @@ struct ChatAgentTurnPresentation: Identifiable, Equatable {
     }
 
     /// Keep each assistant step (including reasoning-only steps) beside its tools.
-    /// The trailing response is rendered separately, with its own reasoning.
+    /// Include the trailing response's activity; only its answer renders separately.
     var activityMessages: [ChatTranscriptMessage] {
-        if finalAssistantMessage != nil {
-            return Array(messages.dropLast())
+        messages.filter { message in
+            message.id != finalAssistantMessage?.id
+                || message.showsThinkingBubble
+                || !message.streamingToolCalls.isEmpty
+                || message.isCompacting
+                || message.compactionMetrics != nil
         }
-        return messages
     }
 
     var thinkingDuration: TimeInterval? {
@@ -104,6 +108,10 @@ struct ChatAgentTurnPresentation: Identifiable, Equatable {
 
     var isAssistantStreaming: Bool {
         assistantMessages.contains(where: \.isStreaming)
+    }
+
+    var isWorking: Bool {
+        isAssistantStreaming || toolUsage.isActive || toolUsage.requiresInteraction
     }
 
     var toolUsage: ChatToolUsageSummary {

@@ -89,7 +89,9 @@ final class ChatTranscriptPresentationTests: XCTestCase {
         var message = ChatTranscriptMessage(role: .assistant, content: "", isStreaming: true, isThinkingEnabled: true)
         message.streamingToolCalls = [.init(index: 0, id: "pending", function: .init(name: "write_file", arguments: #"{"content":"partial"#))]
         let turn = ChatAgentTurnPresentation(messages: [message])
-        XCTAssertEqual(turn.finalAssistantMessage?.id, message.id)
+        XCTAssertNil(turn.finalAssistantMessage)
+        XCTAssertEqual(turn.activityMessages, [message])
+        XCTAssertTrue(turn.isWorking)
         XCTAssertFalse(message.isThinking)
         XCTAssertTrue(message.toolCalls.isEmpty)
         let restored = try JSONDecoder().decode(ChatTranscriptMessage.self, from: JSONEncoder().encode(message))
@@ -123,13 +125,14 @@ final class ChatTranscriptPresentationTests: XCTestCase {
             return XCTFail("Expected a grouped tool turn after loading history")
         }
 
-        XCTAssertEqual(turn.activityMessages.map(\.id), [first, read, second, secondRead, command].map(\.id))
+        XCTAssertEqual(turn.activityMessages.map(\.id), history.map(\.id))
         XCTAssertEqual(
             turn.activityMessages.filter(\.showsThinkingBubble).map(\.reasoningContent),
-            [first.reasoningContent, second.reasoningContent]
+            [first.reasoningContent, second.reasoningContent, final.reasoningContent]
         )
         XCTAssertEqual(turn.finalAssistantMessage?.reasoningContent, final.reasoningContent)
-        XCTAssertEqual(try XCTUnwrap(turn.thinkingDuration), 3, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(turn.thinkingDuration), 6, accuracy: 0.001)
+        XCTAssertFalse(turn.isWorking)
     }
 
     func testNewThinkingStepStaysAfterEarlierToolsDuringStreaming() throws {
@@ -145,7 +148,8 @@ final class ChatTranscriptPresentationTests: XCTestCase {
         for reasoning in ["", "Now verify the result."] {
             next.reasoningContent = reasoning
             let turn = ChatAgentTurnPresentation(messages: [first, read, next])
-            XCTAssertEqual(turn.activityMessages, [first, read])
+            XCTAssertEqual(turn.activityMessages, [first, read, next])
+            XCTAssertTrue(turn.isWorking)
             let current = try XCTUnwrap(turn.finalAssistantMessage)
             XCTAssertEqual(current.id, next.id)
             XCTAssertTrue(current.isThinking)
@@ -156,7 +160,7 @@ final class ChatTranscriptPresentationTests: XCTestCase {
         XCTAssertFalse(next.isThinking)
         XCTAssertTrue(next.showsThinkingBubble)
         XCTAssertEqual(
-            ChatAgentTurnPresentation(messages: [first, read, next]).finalAssistantMessage?.streamingToolCalls,
+            ChatAgentTurnPresentation(messages: [first, read, next]).activityMessages.last?.streamingToolCalls,
             next.streamingToolCalls
         )
 
@@ -171,6 +175,27 @@ final class ChatTranscriptPresentationTests: XCTestCase {
         XCTAssertNil(executing.finalAssistantMessage)
         XCTAssertEqual(executing.activityMessages, [first, read, next, command])
         XCTAssertTrue(executing.toolUsage.requiresInteraction)
+        XCTAssertTrue(executing.isWorking)
+    }
+
+    func testFailedToolDoesNotEndWorkingStateUntilTheTurnFinishes() {
+        let failed = toolResult(id: "read-1", toolName: ChatReadFileToolRegistry.toolName, status: .failed)
+        let running = toolResult(
+            id: "read-2", toolName: ChatReadFileToolRegistry.toolName,
+            status: .running, isStreaming: true
+        )
+        XCTAssertTrue(ChatAgentTurnPresentation(messages: [failed, running]).isWorking)
+
+        let thinking = ChatTranscriptMessage(
+            role: .assistant, content: "", isStreaming: true, isThinkingEnabled: true
+        )
+        XCTAssertTrue(ChatAgentTurnPresentation(messages: [failed, thinking]).isWorking)
+
+        let final = ChatTranscriptMessage(role: .assistant, content: "I couldn't read the file.")
+        let completed = ChatAgentTurnPresentation(messages: [failed, final])
+        XCTAssertFalse(completed.isWorking)
+        XCTAssertEqual(completed.activityMessages, [failed])
+        XCTAssertEqual(completed.finalAssistantMessage, final)
     }
 
     func testEarlierAssistantWithoutToolCallsIsNotMovedAfterLaterTools() {
