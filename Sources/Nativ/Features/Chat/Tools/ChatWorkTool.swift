@@ -3,6 +3,19 @@ import NativServerKit
 
 enum ChatWorkToolRegistry {
     static let toolName = "chat_work"
+    static let incompleteCallInstruction = """
+        The previous generation ended before its tool call was complete. No call from that attempt ran. \
+        Use one short, complete call at a time. For long documents, create the first section and use \
+        update with append_content for subsequent sections.
+        """
+
+    static func canRecoverIncompleteCall(_ error: Error, request: MLXChatCompletionRequest) -> Bool {
+        // mlx-vlm currently reports parser failures as server_error without a dedicated code.
+        guard case NativChatError.serverError("Generation ended with an incomplete tool call.") = error,
+              request.continuation == nil, !request.continueFinalMessage else { return false }
+        return request.tools?.contains { $0.function.name == toolName } == true
+    }
+
     static let sessionPrompt = """
         Use chat_work to search and browse in the shared browser: {"action":"search","query":"search terms"}. \
         For a supplied URL, navigate directly; search is for discovering sources. Use {"action":"navigate","url":"URL"} for the current tab; omit id unless targeting another tab. A search query consisting of an HTTP(S) URL opens that URL. \
@@ -47,6 +60,8 @@ enum ChatWorkToolRegistry {
         Remote websites and terminals have no source file. Create Markdown with {"action":"create","kind":"document",\
         "title":"Notes.md","content":"# Notes"}. Read before updating, then call \
         {"action":"update","id":"ID_FROM_READ","expected_revision":1,"content":"COMPLETE_UPDATED_TEXT"}. \
+        For a long document or multi-page HTML, create the first section, then update with append_content \
+        containing only the next section and the id and revision from the last successful write. Put closing HTML tags in the final chunk. \
         Pass the returned revision as expected_revision \
         to preserve user edits. Include title in update to rename an editable item while passing its complete content and expected_revision. Remote website source cannot be edited. \
         For terminals, reuse an existing terminal from list, or create one with kind terminal and a title only. \
@@ -68,7 +83,8 @@ enum ChatWorkToolRegistry {
                 "kind": .object(["type": .string("string"), "enum": .array(
                     ["document", "code", "website", "terminal"].map { .string($0) }
                 )]),
-                "content": field("Complete text or HTML source; required for update."),
+                "content": field("Complete text or HTML source for create or replacement. For update, supply exactly one of content or append_content."),
+                "append_content": field("For update, append this exact text to the existing source at expected_revision."),
                 "url": field("An http/https URL. Required for navigate. For open, opens a website without needing title, kind, or id. With an explicit id, open navigates that website tab."),
                 "query": .object([
                     "type": .string("string"),
@@ -153,6 +169,7 @@ struct ChatWorkRequest: Decodable {
     var title: String?
     var kind: ChatWorkItem.Kind?
     var content: String?
+    var appendContent: String?
     var url: String?
     var query: String?
     var language: String?
@@ -167,6 +184,7 @@ struct ChatWorkRequest: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case action, id, title, kind, content, url, query, language
+        case appendContent = "append_content"
         case expectedRevision = "expected_revision"
         case elementID = "element_id"
         case attachmentIDs = "attachment_ids"
@@ -213,6 +231,9 @@ struct ChatWorkRequest: Decodable {
 extension ChatWorkState {
     /// Pure state transitions keep agent actions scoped to the request's session.
     mutating func execute(_ request: ChatWorkRequest, fileURL: (ChatWorkItem) -> URL? = { _ in nil }) throws -> String {
+        if request.appendContent != nil && request.action != .update {
+            throw ChatWorkError.invalid("append_content requires action update.")
+        }
         switch request.action {
         case .attachments, .search, .inspect, .navigate, .back, .forward, .reload, .click, .type, .upload, .run, .interrupt:
             throw ChatWorkError.unavailable
@@ -239,11 +260,19 @@ extension ChatWorkState {
                 throw ChatWorkError.missingItem
             }
             if request.action == .update {
-                guard let content = request.content, let revision = request.expectedRevision else {
-                    throw ChatWorkError.invalid("update requires content and expected_revision from read or a revision_conflict result.")
+                guard let revision = request.expectedRevision else {
+                    throw ChatWorkError.invalid("update requires expected_revision.")
+                }
+                let content: String
+                switch (request.content, request.appendContent) {
+                case (let replacement?, nil): content = replacement
+                case (nil, let suffix?): content = item.content + suffix
+                default:
+                    throw ChatWorkError.invalid("update requires expected_revision and exactly one of content or append_content.")
                 }
                 let updated = try update(
-                    id: id, content: content, expectedRevision: revision, title: request.title, author: "Agent"
+                    id: id, content: content,
+                    expectedRevision: revision, title: request.title, author: "Agent"
                 )
                 open(id)
                 return try Self.itemJSON(updated, includeContent: false, fileURL: fileURL(updated))

@@ -2875,6 +2875,7 @@ final class ChatViewModel: ObservableObject {
         )
         var assistantMessageID = queuedRequest.assistantMessageID
         var toolRounds = 0
+        var incompleteCallRetryID: UUID?
         var researchContinuations = 0
         var tracksWorkSaves = workState(for: request.sessionID)?.items.contains(where: \.canEdit) == true
         var savedWorkFiles: [UUID: String] = [:]
@@ -2939,6 +2940,7 @@ final class ChatViewModel: ObservableObject {
             if advertisesTools, request.tools?.contains(where: { $0.function.name == ChatWorkToolRegistry.toolName }) == true {
                 request.completionInstruction = [
                     request.completionInstruction,
+                    incompleteCallRetryID == assistantMessageID ? ChatWorkToolRegistry.incompleteCallInstruction : nil,
                     ChatBrowserEvidence.missingPageInstruction(messages: request.messages),
                     ChatBrowserEvidence.stalledSearchInstruction(messages: request.messages),
                 ].compactMap { $0 }.joined(separator: "\n\n")
@@ -2955,6 +2957,7 @@ final class ChatViewModel: ObservableObject {
                     in: streamingSessionID
                 )
             }
+            let originalMessage = message(streamingMessageID, in: streamingSessionID)
             let eventRelay = ChatStreamEventRelay(delivery: appendEvent)
             let completion: MLXChatCompletion
             do {
@@ -3014,6 +3017,13 @@ final class ChatViewModel: ObservableObject {
                 eventRelay.finish()
             } catch {
                 eventRelay.cancel()
+                try Task.checkCancellation()
+                if incompleteCallRetryID == nil, ChatWorkToolRegistry.canRecoverIncompleteCall(error, request: request),
+                   ownsActiveRequest(queuedRequest.id), let originalMessage {
+                    updateMessage(streamingMessageID, in: streamingSessionID) { $0 = originalMessage }
+                    incompleteCallRetryID = streamingMessageID
+                    continue
+                }
                 throw error
             }
             let toolCalls = normalizedToolCalls(completion.toolCalls)

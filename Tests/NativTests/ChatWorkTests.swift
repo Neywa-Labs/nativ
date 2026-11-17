@@ -220,6 +220,25 @@ final class ChatWorkTests: XCTestCase {
         XCTAssertEqual(state.selectedItem?.content, "print(1)")
     }
 
+    func testAssembleHTMLInRevisionCheckedChunks() throws {
+        var state = ChatWorkState()
+        let item = try state.create(title: "Article.html", kind: .website, content: "<article>Page 1")
+        let call = MLXChatToolCall(id: "p2", function: .init(name: "chat_work", arguments:
+            #"{"action":"update","id":"ID","expected_revision":1,"append_content":" Page 2"}"#
+                .replacingOccurrences(of: "ID", with: item.id.uuidString)))
+        var request = try ChatWorkRequest.decode(call)
+        let result = try json(state.execute(request))
+        XCTAssertEqual(result["revision"] as? Int, 2)
+        XCTAssertThrowsError(try state.execute(request))
+        request.expectedRevision = 2
+        request.content = "replace"
+        XCTAssertThrowsError(try state.execute(request))
+        request.content = nil
+        request.appendContent = "</article>"
+        _ = try state.execute(request)
+        XCTAssertEqual(state.selectedItem?.content, "<article>Page 1 Page 2</article>")
+    }
+
     func testAgentCannotOverwriteAnInterveningUserEdit() throws {
         var state = ChatWorkState()
         let item = try state.create(title: "Notes", kind: .document, content: "Original")
