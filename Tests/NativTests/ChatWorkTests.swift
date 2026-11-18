@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 import SwiftTerm
 import NativServerKit
 
@@ -395,6 +396,105 @@ final class ChatWorkTests: XCTestCase {
 
 @MainActor
 final class ChatWorkSessionTests: XCTestCase {
+    /// Opt-in replay against a local vision model using the four District Record test scans.
+    func testLiveFourPageTranscription() async throws {
+        guard let directory = ProcessInfo.processInfo.environment["NATIV_OCR_REPLAY_DIRECTORY"] else {
+            throw XCTSkip("Set NATIV_OCR_REPLAY_DIRECTORY to the folder containing page-1.png through page-4.png.")
+        }
+        var settings = NativSettings.load()
+        settings.maxTokens = 2048
+        settings.compactionEnabled = true
+        settings.thinkingEnabled = true
+        settings.mcpServers = []
+        settings.customTools = []
+        let scans = try (1...4).map { number in
+            let name = "page-\(number).png"
+            let data = try Data(contentsOf: URL(fileURLWithPath: directory).appendingPathComponent(name))
+            return ChatImageAttachment(filename: name, mimeType: "image/png", base64Data: data.base64EncodedString())
+        }
+        let prompt = "Transcribe all four pages verbatim, preserving every numbered entry in order. Create one HTML document in the work pane containing the complete transcript. Do not summarize."
+        let user = ChatTranscriptMessage(role: .user, content: prompt, imageAttachments: scans)
+        let (root, store, original) = try fixture(mediaStore: .shared)
+        var session = original
+        session.messages = [user]
+        XCTAssertTrue(store.saveSession(session))
+        defer {
+            for file in store.loadSessions().flatMap(\.messages).flatMap(\.imageAttachments) {
+                if let url = file.assetFileURL { try? FileManager.default.removeItem(at: url) }
+            }
+        }
+        let chat = subject(root)
+        try await loaded(chat)
+        chat.selectSession(session.id)
+        chat.enqueueGeneration(for: user.id, in: session.id, settings: settings, languageModelSupportsTools: true,
+                               languageModelSupportsVision: true, appModel: nil)
+        let deadline = ContinuousClock.now + .seconds(300)
+        while chat.isSessionBusy(session.id), ContinuousClock.now < deadline {
+            if let pending = chat.messages.first(where: { $0.toolStatus == .awaitingConsent }) {
+                let work = pending.toolArguments?.data(using: .utf8).flatMap { try? JSONDecoder().decode(ChatWorkRequest.self, from: $0) }
+                if pending.toolName == "chat_work", work?.action == .create, work?.transcribeImages == true,
+                   chat.workState.items.isEmpty {
+                    chat.confirmToolConsent(pending.id)
+                } else {
+                    chat.denyToolConsent(pending.id)
+                }
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        XCTAssertFalse(chat.isSessionBusy(session.id))
+        XCTAssertFalse(chat.messages.contains { $0.role == .error })
+        XCTAssertEqual(chat.workState.items.count, 1)
+        let item = try XCTUnwrap(chat.workState.selectedItem)
+        XCTAssertEqual(item.content.components(separatedBy: "<section>").count - 1, 4, item.title)
+        let saved = try XCTUnwrap(chat.workFileURL(for: item))
+        XCTAssertEqual(try String(contentsOf: saved, encoding: .utf8), item.content)
+        let attachment = XCTAttachment(contentsOfFile: saved)
+        attachment.name = "Four-page transcript.html"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        var remainder = item.content[...]
+        for number in 1...72 {
+            let label = String(format: "%02d. At", number)
+            let range = try XCTUnwrap(remainder.range(of: label), "Missing or out-of-order entry \(label)")
+            remainder = remainder[range.upperBound...]
+        }
+    }
+
+    func testCreateTranscriptFromAttachedScans() async throws {
+        let (root, store, original) = try fixture(mediaStore: .shared)
+        var session = original
+        let attachments = try ["First page", "Second page"].map { label in
+            let image = NSImage(size: NSSize(width: 700, height: 180), flipped: false) { rect in
+                NSColor.white.setFill()
+                rect.fill()
+                (label as NSString).draw(at: NSPoint(x: 40, y: 55), withAttributes: [
+                    .font: NSFont.systemFont(ofSize: 52), .foregroundColor: NSColor.black
+                ])
+                return true
+            }
+            let data = try XCTUnwrap(image.tiffRepresentation)
+            return ChatImageAttachment(filename: label + ".tiff", mimeType: "image/tiff",
+                                       base64Data: data.base64EncodedString())
+        }
+        session.messages = [.init(role: .user, content: "Transcribe both pages.", imageAttachments: attachments)]
+        XCTAssertTrue(store.saveSession(session))
+        defer {
+            for file in store.loadSessions().flatMap(\.messages).flatMap(\.imageAttachments) {
+                if let url = file.assetFileURL { try? FileManager.default.removeItem(at: url) }
+            }
+        }
+        let chat = subject(root)
+        try await loaded(chat)
+        let run = dispatcher(chat, sessionID: session.id, baseURL: root)
+        let receipt = try await run(["action": "create", "kind": "website", "title": "Pages.html", "transcribe_images": true])
+        let item = try XCTUnwrap(chat.workState.selectedItem)
+        XCTAssertEqual(receipt["id"] as? String, item.id.uuidString)
+        let first = try XCTUnwrap(item.content.range(of: "First page"))
+        let second = try XCTUnwrap(item.content.range(of: "Second page"))
+        XCTAssertLessThan(first.lowerBound, second.lowerBound)
+        XCTAssertEqual(try String(contentsOf: XCTUnwrap(chat.workFileURL(for: item)), encoding: .utf8), item.content)
+    }
+
     func testOriginalAttachmentsRemainDiscoverableAfterReloadAndUploadOnlyFromTheirSession() async throws {
         let (root, store, original) = try fixture()
         let bytes = Data("%PDF-1.7\nFull original document, beyond any excerpt.\n".utf8) + Data([0, 255, 128])
@@ -1200,10 +1300,10 @@ final class ChatWorkSessionTests: XCTestCase {
         }
     }
 
-    private func fixture() throws -> (URL, ChatSessionStore, ChatSession) {
+    private func fixture(mediaStore: MediaAssetStore? = nil) throws -> (URL, ChatSessionStore, ChatSession) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = ChatSessionStore(chatDirectory: root.appendingPathComponent("Chat"),
-                                     mediaStore: MediaAssetStore(rootDirectory: root.appendingPathComponent("Media")))
+                                     mediaStore: mediaStore ?? MediaAssetStore(rootDirectory: root.appendingPathComponent("Media")))
         let now = Date()
         let session = ChatSession(id: UUID(), title: "Existing", customTitle: "My existing chat",
                                   createdAt: now, updatedAt: now, messages: [],

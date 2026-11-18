@@ -6,7 +6,9 @@ enum ChatWorkToolRegistry {
     static let incompleteCallInstruction = """
         The previous generation ended before its tool call was complete. No call from that attempt ran. \
         Use one short, complete call at a time. For long documents, create the first section and use \
-        update with append_content for subsequent sections.
+        update with append_content for subsequent sections. For a transcript of attached scans use the \
+        native OCR call {"action":"create","kind":"website","title":"Transcript.html","transcribe_images":true}. \
+        Omit content: Nativ reads the images and writes the transcript directly.
         """
 
     static func canRecoverIncompleteCall(_ error: Error, request: MLXChatCompletionRequest) -> Bool {
@@ -16,7 +18,51 @@ enum ChatWorkToolRegistry {
         return request.tools?.contains { $0.function.name == toolName } == true
     }
 
+    /// Consider a local transcript before spending the generation budget on image text.
+    static func htmlTranscriptRoutingRequest(
+        for message: ChatTranscriptMessage, original: MLXChatCompletionRequest
+    ) -> MLXChatCompletionRequest? {
+        guard message.content.localizedCaseInsensitiveContains("html"), !message.imageAttachments.isEmpty,
+              original.tools?.contains(where: { $0.function.name == toolName }) == true,
+              message.imageAttachments.allSatisfy({ $0.chatAttachmentKind == .image }),
+              message.imageAttachments.count <= ChatWorkAttachments.maximumFiles else { return nil }
+        let instruction = """
+            You select a tool, without reading the scans yourself. If the user explicitly requests a new HTML \
+            document transcribing all the attached pages in order, call chat_work with \
+            {"action":"create","kind":"website","title":"Transcript.html","transcribe_images":true}. \
+            Use their filename if supplied. Otherwise reply SKIP. This operation cannot edit an existing file, \
+            select only some pages, translate, summarize, or perform additional requested work. Omit content: the tool reads the original scans.
+            """
+        let createHTML = MLXChatToolDefinition(function: .init(name: toolName,
+            description: "Create one new HTML transcript of all attached images in order using native OCR.",
+            parameters: .object([
+                "type": .string("object"), "additionalProperties": .bool(false),
+                "properties": .object([
+                    "action": .object(["type": .string("string"), "enum": .array([.string("create")])]),
+                    "kind": .object(["type": .string("string"), "enum": .array([.string("website")])]),
+                    "title": field("HTML filename, e.g. Transcript.html"),
+                    "transcribe_images": .object(["type": .string("boolean"), "enum": .array([.bool(true)])])
+                ]),
+                "required": .array(["action", "kind", "title", "transcribe_images"].map { .string($0) })
+            ])))
+        return MLXChatCompletionRequest(model: original.model, messages: [
+            .init(role: "system", content: instruction), .init(role: "user", content: message.content)
+        ], maxTokens: min(original.maxTokens, 256), temperature: 0, topK: 0, topP: 1, minP: 0,
+           enableThinking: false, tools: [createHTML], toolChoice: "auto")
+    }
+
+    static func isTranscriptionCompletion(_ completion: MLXChatCompletion) -> Bool {
+        guard completion.toolCalls.count == 1, let call = completion.toolCalls.first,
+              call.function?.name == toolName, let work = try? ChatWorkRequest.decode(call) else { return false }
+        return work.action == .create && work.transcribeImages == true
+            && work.kind == .website && work.title != nil
+            && work.url == nil && work.content == nil && work.appendContent == nil && work.attachmentIDs == nil
+    }
+
     static let sessionPrompt = """
+        For requests to transcribe attached scans into a work-pane document, use chat_work create with \
+        transcribe_images=true and omit content. Nativ recognizes the pages locally in attachment order. \
+        Use attachment_ids for a subset or for earlier attachments. \
         Use chat_work to search and browse in the shared browser: {"action":"search","query":"search terms"}. \
         For a supplied URL, navigate directly; search is for discovering sources. Use {"action":"navigate","url":"URL"} for the current tab; omit id unless targeting another tab. A search query consisting of an HTTP(S) URL opens that URL. \
         Search returns results with an open action: copy that action into chat_work to read the result. open with its element_id follows the captured source link, including after another source was opened. Never reconstruct a URL from a result title or display address. For a supplied URL, use open or navigate; inspect reads the current tab. \
@@ -84,6 +130,10 @@ enum ChatWorkToolRegistry {
                     ["document", "code", "website", "terminal"].map { .string($0) }
                 )]),
                 "content": field("Complete text or HTML source for create or replacement. For update, supply exactly one of content or append_content."),
+                "transcribe_images": .object([
+                    "type": .string("boolean"),
+                    "description": .string("For create only: transcribe image attachments directly into a document or HTML website. Omit content. Defaults to images on the latest user message in order; use attachment_ids for specific pages.")
+                ]),
                 "append_content": field("For update, append this exact text to the existing source at expected_revision."),
                 "url": field("An http/https URL. Required for navigate. For open, opens a website without needing title, kind, or id. With an explicit id, open navigates that website tab."),
                 "query": .object([
@@ -97,7 +147,7 @@ enum ChatWorkToolRegistry {
                     "type": .string("array"),
                     "items": .object(["type": .string("string")]),
                     "minItems": .number(1), "maxItems": .number(20), "uniqueItems": .bool(true),
-                    "description": .string("For upload, IDs returned by attachments for this chat. Sends each original file with its filename and MIME type. No paths or file contents.")
+                    "description": .string("For upload or transcribe_images, IDs returned by attachments for this chat. Sends each original file with its filename and MIME type. No paths or file contents.")
                 ]),
                 "text": field("Text to fill into the inspected input; required for type."),
                 "command": field("Shell command for run, executed in the selected terminal or the terminal identified by id. Do not create a new terminal if one is already open."),
@@ -170,6 +220,7 @@ struct ChatWorkRequest: Decodable {
     var kind: ChatWorkItem.Kind?
     var content: String?
     var appendContent: String?
+    var transcribeImages: Bool?
     var url: String?
     var query: String?
     var language: String?
@@ -184,6 +235,7 @@ struct ChatWorkRequest: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case action, id, title, kind, content, url, query, language
+        case transcribeImages = "transcribe_images"
         case appendContent = "append_content"
         case expectedRevision = "expected_revision"
         case elementID = "element_id"
