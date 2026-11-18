@@ -1103,6 +1103,7 @@ final class HuggingFaceDownloadManager: ObservableObject {
         let volumeIdentifier: String?
         let token: String?
         let revision: String?
+        let imageDownload: Bool
         var onCompletion: (() -> Void)?
         var operation: HuggingFaceDownloadOperation?
         var task: Task<Void, Never>?
@@ -1114,6 +1115,7 @@ final class HuggingFaceDownloadManager: ObservableObject {
             volumeIdentifier: String?,
             token: String?,
             revision: String?,
+            imageDownload: Bool,
             onCompletion: (() -> Void)?
         ) {
             self.modelID = modelID
@@ -1121,6 +1123,7 @@ final class HuggingFaceDownloadManager: ObservableObject {
             self.volumeIdentifier = volumeIdentifier
             self.token = token
             self.revision = revision
+            self.imageDownload = imageDownload
             self.onCompletion = onCompletion
         }
     }
@@ -1200,6 +1203,7 @@ final class HuggingFaceDownloadManager: ObservableObject {
         repoID: String,
         sizeBytes: Int64?,
         revision: String? = nil,
+        imageDownload: Bool = false,
         cachePath: String,
         volumeIdentifier: String?,
         token: String?,
@@ -1215,6 +1219,7 @@ final class HuggingFaceDownloadManager: ObservableObject {
                 repoID: repoID,
                 sizeBytes: sizeBytes,
                 revision: revision,
+                imageDownload: imageDownload,
                 cachePath: cachePath,
                 volumeIdentifier: volumeIdentifier,
                 token: token,
@@ -1230,6 +1235,7 @@ final class HuggingFaceDownloadManager: ObservableObject {
         repoID: String,
         sizeBytes: Int64?,
         revision: String? = nil,
+        imageDownload: Bool = false,
         cachePath: String,
         volumeIdentifier: String?,
         token: String?
@@ -1246,6 +1252,7 @@ final class HuggingFaceDownloadManager: ObservableObject {
                     repoID: repoID,
                     sizeBytes: sizeBytes,
                     revision: revision,
+                    imageDownload: imageDownload,
                     cachePath: expandedCachePath,
                     volumeIdentifier: volumeIdentifier,
                     token: token,
@@ -1368,6 +1375,7 @@ final class HuggingFaceDownloadManager: ObservableObject {
         repoID: String,
         sizeBytes: Int64?,
         revision: String? = nil,
+        imageDownload: Bool = false,
         cachePath: String,
         volumeIdentifier: String?,
         token: String?,
@@ -1383,6 +1391,7 @@ final class HuggingFaceDownloadManager: ObservableObject {
             volumeIdentifier: volumeIdentifier,
             token: token,
             revision: revision,
+            imageDownload: imageDownload,
             onCompletion: onCompletion
         )
         contexts[repoID] = context
@@ -1413,6 +1422,7 @@ final class HuggingFaceDownloadManager: ObservableObject {
             cachePath: context.cachePath,
             token: normalizedToken,
             revision: context.revision,
+            imageDownload: context.imageDownload,
             progress: { [weak self] progress in
                 Task { @MainActor [weak self] in
                     self?.updateProgress(repoID, progress)
@@ -1797,13 +1807,17 @@ private final class HuggingFaceDownloadActivity: @unchecked Sendable {
 }
 
 enum HuggingFaceDownloadOutput: Equatable {
+    case imageManifest(ImageDownloadManifest)
     case reservation(Int64)
     case progress(ModelDownloadProgress)
     case transferredBytes(Int64)
     case phase(HuggingFaceDownloadManager.DownloadPhase)
 
     init?(line: String) {
-        if let payload = Self.payload(in: line, after: "__NATIV_RESERVE__:"),
+        if line.hasPrefix("__NATIV_IMAGE_MANIFEST__:"),
+           let manifest = try? JSONDecoder().decode(ImageDownloadManifest.self, from: Data(line.dropFirst("__NATIV_IMAGE_MANIFEST__:".count).utf8)) {
+            self = .imageManifest(manifest)
+        } else if let payload = Self.payload(in: line, after: "__NATIV_RESERVE__:"),
            let bytes = Int64(payload) {
             self = .reservation(bytes)
         } else if let payload = Self.payload(in: line, after: "__NATIV_PROGRESS__:"),
@@ -1965,6 +1979,7 @@ final class HuggingFaceDownloadOperation: @unchecked Sendable {
         cachePath: String,
         token: String?,
         revision: String?,
+        imageDownload: Bool,
         progress: @escaping @Sendable (ModelDownloadProgress) -> Void,
         transferSpeed: @escaping @Sendable (Double?) -> Void,
         phase: @escaping @Sendable (HuggingFaceDownloadManager.DownloadPhase) -> Void
@@ -2095,7 +2110,8 @@ final class HuggingFaceDownloadOperation: @unchecked Sendable {
             cachePath,
             String(ProcessInfo.processInfo.processIdentifier),
             revision ?? "main",
-            helperURL.path
+            helperURL.path,
+            imageDownload ? "image" : "auto"
         ]
         self.init(executableURL: pythonURL, arguments: arguments, environment: environment,
                   cachePath: cachePath, capacity: .shared,
@@ -2177,6 +2193,7 @@ final class HuggingFaceDownloadOperation: @unchecked Sendable {
         DispatchQueue.global(qos: .utility).async {
             [self, activity, phase, progress] in
             var lineBuffer = ""
+            var imageBlocker: String?
             while true {
                 let data = pipe.fileHandleForReading.availableData
                 guard !data.isEmpty else { break }
@@ -2190,10 +2207,15 @@ final class HuggingFaceDownloadOperation: @unchecked Sendable {
                 for line in lines.dropLast() {
                     guard let output = HuggingFaceDownloadOutput(line: line) else { continue }
                     switch output {
+                    case .imageManifest(let manifest):
+                        imageBlocker = MLXImageModelResolver.shared.downloadBlocker(for: manifest)
                     case .reservation(let bytes):
                         let response: [String: Any]
                         do {
                             guard !isCancelled else { throw CancellationError() }
+                            if let imageBlocker {
+                                throw HuggingFaceDownloadFailure.message(imageBlocker)
+                            }
                             try capacity.reserve(reservationID, bytes: bytes, atPath: cachePath)
                             response = ["approved": true]
                         } catch {

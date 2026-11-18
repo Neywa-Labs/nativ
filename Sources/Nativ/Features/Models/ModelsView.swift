@@ -954,6 +954,7 @@ struct ModelsView: View {
                                     repoID: hubModel.id,
                                     sizeBytes: downloadSizeBytes,
                                     revision: hubModel.revision,
+                                    imageDownload: !hubModel.capabilities.isDisjoint(with: [.imageGeneration, .imageEditing]),
                                     cachePath: modelState.settings.modelSearchPath,
                                     volumeIdentifier: modelState.settings
                                         .externalModelCache?.volumeIdentifier,
@@ -2626,6 +2627,7 @@ private struct HubModelMemoryFitWarning: Equatable {
 
 private struct HubModelRow: View, @MainActor Equatable {
     let model: HuggingFaceModel
+    let imageCompatibility: ImagePackageCompatibility?
     let downloadSizeBytes: Int64?
     let isResolvingSize: Bool
     let isInstalled: Bool
@@ -2643,6 +2645,7 @@ private struct HubModelRow: View, @MainActor Equatable {
         // Actions are intentionally excluded: they do not affect rendering,
         // while closures are recreated whenever the parent view is rebuilt.
         lhs.model == rhs.model
+            && lhs.imageCompatibility == rhs.imageCompatibility
             && lhs.downloadSizeBytes == rhs.downloadSizeBytes
             && lhs.isResolvingSize == rhs.isResolvingSize
             && lhs.isInstalled == rhs.isInstalled
@@ -2692,7 +2695,7 @@ private struct HubModelRow: View, @MainActor Equatable {
                                 if model.isGated {
                                     ModelPill(title: "Gated", systemImage: "lock")
                                 }
-                                if model.support == .unsupported {
+                                if model.support == .unsupported && imageCompatibility == nil {
                                     ModelPill(
                                         title: "Unsupported",
                                         systemImage: "exclamationmark.triangle.fill",
@@ -2767,15 +2770,35 @@ private struct HubModelRow: View, @MainActor Equatable {
                     )
                 } else {
                     HubModelDownloadButton(
-                        isDisabled: model.isPrivate,
+                        isDisabled: model.isPrivate || imageCompatibility?.blocker != nil,
                         help: downloadHelp,
                         action: onDownload
                     )
                 }
             }
 
-            if let downloadError {
+            if let downloadError, downloadError.localizedDescription != imageCompatibility?.blocker {
                 downloadErrorView(downloadError)
+            }
+            if let imageCompatibility {
+                switch imageCompatibility {
+                case .blocked(let reason):
+                    Label(reason, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .font(.caption)
+                case .recognized:
+                    Label("Expected to work", systemImage: "checkmark.circle")
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                case .unknown:
+                    Text("Image compatibility unknown")
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                }
+            } else if isResolvingSize && !model.capabilities.isDisjoint(with: [.imageGeneration, .imageEditing]) {
+                Text("Checking image compatibility…")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
             }
         }
         .padding(14)
@@ -2783,6 +2806,7 @@ private struct HubModelRow: View, @MainActor Equatable {
     }
 
     private var downloadHelp: String {
+        if let reason = imageCompatibility?.blocker { return reason }
         return model.isGated
             ? "Gated models require Hugging Face authentication."
             : "Download to the configured cache"
@@ -2970,12 +2994,13 @@ private struct HubModelRowContainer: View, @MainActor Equatable {
     private let downloadManager = HuggingFaceDownloadManager.shared
     @State private var downloadSnapshot: HuggingFaceDownloadManager.RowSnapshot
 
-    @State private var resolvedSize: Int64?
+    @State private var details: HubModelSizeResolver.Details?
     @State private var resolvedRequest: HubModelSizeResolver.Request?
     @State private var isResolvingSize = true
 
     private var sizeRequest: HubModelSizeResolver.Request {
-        .init(repoID: model.id, revision: model.revision, token: token)
+        .init(repoID: model.id, revision: model.revision, token: token,
+              checkImage: !model.capabilities.isDisjoint(with: [.imageGeneration, .imageEditing]))
     }
 
     let token: String?
@@ -3005,9 +3030,10 @@ private struct HubModelRowContainer: View, @MainActor Equatable {
         self.onDownload = onDownload
         self.onPauseResume = onPauseResume
         self.onRemoveDownload = onRemoveDownload
-        let request = HubModelSizeResolver.Request(repoID: model.id, revision: model.revision, token: token)
-        let cached = HubModelSizeResolver.shared.cachedSize(for: request)
-        _resolvedSize = State(initialValue: cached)
+        let request = HubModelSizeResolver.Request(repoID: model.id, revision: model.revision, token: token,
+            checkImage: !model.capabilities.isDisjoint(with: [.imageGeneration, .imageEditing]))
+        let cached = HubModelSizeResolver.shared.cachedDetails(for: request)
+        _details = State(initialValue: cached)
         _resolvedRequest = State(initialValue: cached == nil ? nil : request)
         _isResolvingSize = State(initialValue: cached == nil)
         _downloadSnapshot = State(
@@ -3023,9 +3049,11 @@ private struct HubModelRowContainer: View, @MainActor Equatable {
     }
 
     var body: some View {
-        let downloadSizeBytes = resolvedRequest == sizeRequest ? resolvedSize : nil
+        let currentDetails = resolvedRequest == sizeRequest ? details : nil
+        let downloadSizeBytes = currentDetails?.bytes
         HubModelRow(
             model: model,
+            imageCompatibility: currentDetails?.image ?? (!isResolvingSize && resolvedRequest == sizeRequest && sizeRequest.checkImage == true ? .unknown : nil),
             downloadSizeBytes: downloadSizeBytes,
             isResolvingSize: resolvedRequest != sizeRequest || isResolvingSize,
             isInstalled: isInstalled,
@@ -3044,22 +3072,18 @@ private struct HubModelRowContainer: View, @MainActor Equatable {
         .equatable()
         .task(id: sizeRequest) {
             let request = sizeRequest
-            if let cached = HubModelSizeResolver.shared.cachedSize(for: request) {
-                if resolvedRequest != request || resolvedSize != cached || isResolvingSize {
-                    resolvedRequest = request
-                    resolvedSize = cached
-                    isResolvingSize = false
-                }
+            if let cached = HubModelSizeResolver.shared.cachedDetails(for: request) {
+                details = cached
+                resolvedRequest = request
+                isResolvingSize = false
                 return
             }
             isResolvingSize = true
-            resolvedSize = nil
+            details = nil
             resolvedRequest = request
-            let bytes = await HubModelSizeResolver.shared.resolveSize(
-                for: request.repoID, revision: request.revision, token: request.token
-            )
+            let result = await HubModelSizeResolver.shared.resolveDetails(for: request)
             guard !Task.isCancelled else { return }
-            resolvedSize = bytes
+            details = result
             isResolvingSize = false
         }
         .onReceive(downloadManager.rowUpdates) { updatedModelID in

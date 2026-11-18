@@ -94,7 +94,7 @@ struct MLXImageModelResolver: Sendable {
     private func supportedModelType(
         model: String,
         at root: URL,
-        fileManager: FileManager,
+        fileManager: any ImagePackageFiles,
         supportedModelTypes: Set<String>
     ) -> String? {
         var candidates = localModelTypes(at: root, fileManager: fileManager)
@@ -105,17 +105,76 @@ struct MLXImageModelResolver: Sendable {
                 modelType: candidate,
                 at: root,
                 fileManager: fileManager
-            ) {
+            ) != false {
                 return candidate
             }
         }
         return nil
     }
 
+    /// A missing verdict leaves inconclusive packages eligible for download.
+    func downloadBlocker(for package: ImageDownloadManifest) -> String? {
+        imageCompatibility(for: package).blocker
+    }
+
+    func imageCompatibility(for package: ImageDownloadManifest) -> ImagePackageCompatibility {
+        let files = RemoteImagePackage(package)
+        let root = files.root
+        func config(_ path: String) -> [String: Any]? {
+            loadJSONObject(at: root.appendingPathComponent(path), fileManager: files)
+        }
+        let pipeline = config("model_index.json")?["_class_name"] as? String
+        let supported = generationModelTypes.union(editingModelTypes)
+        if pipeline?.hasPrefix("StableDiffusionXL") == true,
+           supported.isDisjoint(with: ["sdxl", "stable_diffusion_xl"]) {
+            return .blocked("This is a Stable Diffusion XL (SDXL) pipeline. This Nativ build has no SDXL image backend.")
+        }
+        if !files.paths.contains("model_index.json"),
+           files.paths.contains("transformer/adapter_model.safetensors"),
+           !files.paths.contains(where: {
+               $0.hasSuffix(".safetensors") && !$0.hasSuffix("adapter_model.safetensors")
+                   && !$0.hasPrefix("loras/")
+           }),
+           let adapter = config("transformer/adapter_config.json"),
+           (adapter["peft_type"] as? String)?.uppercased() == "LORA" {
+            let base = adapter["base_model_name_or_path"] as? String
+            return .blocked("This is a LoRA adapter. Standalone generation requires its base model"
+                + (base.flatMap { $0.isEmpty ? nil : " (\($0))" } ?? "") + ".")
+        }
+
+        var candidates = localModelTypes(at: root, fileManager: files)
+        addModelType(modelType(from: package.model), to: &candidates)
+        let families = candidates.filter(supported.contains)
+        guard !families.isEmpty else { return .unknown }
+        if families == ["z_image"] {
+            let required = ["scheduler/scheduler_config.json", "transformer/config.json",
+                            "text_encoder/config.json", "vae/config.json", "tokenizer/tokenizer.json"]
+            if let missing = required.first(where: { !files.paths.contains($0) }) {
+                return .blocked("This Z-Image package is missing \(missing).")
+            }
+            for component in ["transformer", "text_encoder", "vae"]
+                where !hasSafetensors(in: component, at: root, fileManager: files) {
+                return .blocked("This Z-Image package is missing weights in \(component)/.")
+            }
+        }
+        if families.contains("flux3"),
+           let fluxConfig = config("config.json"), isFlux3Configuration(fluxConfig),
+           let quantization = fluxConfig["quantization"], !(quantization is NSNull),
+           (quantization as? [String: Any])?.isEmpty != true {
+            return .blocked("This Nativ build cannot load this FLUX.3 quantization.")
+        }
+        guard package.metadataComplete else { return .unknown }
+        if families == ["z_image"] { return .recognized }
+        let layouts = families.map { supportsLocalLayout(modelType: $0, at: root, fileManager: files) }
+        if layouts.contains(true) { return .recognized }
+        if layouts.contains(nil) { return .unknown }
+        return .blocked("This repository does not contain the file layout required by Nativ’s \(families[0]) image backend.")
+    }
+
     private func isMageFlowEditModel(
         model: String,
         at root: URL,
-        fileManager: FileManager
+        fileManager: any ImagePackageFiles
     ) -> Bool {
         if Self.isKnownImageEditOnlyModelID(model) {
             return true
@@ -135,7 +194,7 @@ struct MLXImageModelResolver: Sendable {
 
     private func localModelTypes(
         at root: URL,
-        fileManager: FileManager
+        fileManager: any ImagePackageFiles
     ) -> [String] {
         var candidates: [String] = []
 
@@ -159,12 +218,7 @@ struct MLXImageModelResolver: Sendable {
             addModelType("qwen_image", to: &candidates)
         }
 
-        let componentURLs =
-            (try? fileManager.contentsOfDirectory(
-                at: root,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            )) ?? []
+        let componentURLs = fileManager.children(of: root)
         for componentURL in componentURLs.sorted(by: { $0.path < $1.path }) {
             // Shared autoencoders and schedulers don't identify the image
             // model family (MOSS-Image, for example, uses the Flux 2 VAE).
@@ -324,7 +378,7 @@ struct MLXImageModelResolver: Sendable {
 
     private func transformerWeightNames(
         at root: URL,
-        fileManager: FileManager
+        fileManager: any ImagePackageFiles
     ) -> Set<String> {
         for filename in [
             "diffusion_pytorch_model.safetensors.index.json",
@@ -369,10 +423,10 @@ struct MLXImageModelResolver: Sendable {
 
     private func loadJSONObject(
         at url: URL,
-        fileManager: FileManager
+        fileManager: any ImagePackageFiles
     ) -> [String: Any]? {
         guard fileManager.fileExists(atPath: url.path),
-            let data = try? Data(contentsOf: url),
+            let data = fileManager.metadata(at: url),
             let object = try? JSONSerialization.jsonObject(with: data)
                 as? [String: Any]
         else {
@@ -384,8 +438,8 @@ struct MLXImageModelResolver: Sendable {
     private func supportsLocalLayout(
         modelType: String,
         at root: URL,
-        fileManager: FileManager
-    ) -> Bool {
+        fileManager: any ImagePackageFiles
+    ) -> Bool? {
         switch modelType {
         case "bonsai":
             return [
@@ -597,22 +651,17 @@ struct MLXImageModelResolver: Sendable {
         default:
             // The generated manifest is authoritative for newly bundled
             // backends whose local layout is not yet known to the app.
-            return true
+            return nil
         }
     }
 
     private func hasSafetensors(
         in directory: String,
         at root: URL,
-        fileManager: FileManager
+        fileManager: any ImagePackageFiles
     ) -> Bool {
         let directoryURL = root.appendingPathComponent(directory)
-        let contents =
-            (try? fileManager.contentsOfDirectory(
-                at: directoryURL,
-                includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]
-            )) ?? []
+        let contents = fileManager.children(of: directoryURL)
         return contents.contains { $0.pathExtension == "safetensors" }
     }
 
@@ -636,4 +685,70 @@ struct MLXImageModelResolver: Sendable {
     private static let pascalCaseTokenRegex = try! NSRegularExpression(
         pattern: #"[A-Z]+(?=[A-Z][a-z]|$)|[A-Z][a-z0-9]*"#
     )
+}
+
+private protocol ImagePackageFiles {
+    func fileExists(atPath path: String) -> Bool
+    func children(of directory: URL) -> [URL]
+    func metadata(at url: URL) -> Data?
+}
+
+extension FileManager: ImagePackageFiles {
+    fileprivate func children(of directory: URL) -> [URL] {
+        (try? contentsOfDirectory(at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+    }
+
+    fileprivate func metadata(at url: URL) -> Data? { try? Data(contentsOf: url) }
+}
+
+struct ImageDownloadManifest: Decodable, Equatable {
+    let model: String
+    let paths: [String]
+    let metadata: [String: String]
+    let metadataComplete: Bool
+}
+
+/// Interpret Hub paths in memory. No repository filenames are written to disk.
+private struct RemoteImagePackage: ImagePackageFiles {
+    let root = URL(fileURLWithPath: "/", isDirectory: true)
+    let paths: Set<String>
+    private let manifest: ImageDownloadManifest
+    private let childrenByDirectory: [String: Set<String>]
+
+    init(_ manifest: ImageDownloadManifest) {
+        self.manifest = manifest
+        paths = Set(manifest.paths)
+        var children: [String: Set<String>] = [:]
+        for path in paths {
+            let parts = path.split(separator: "/")
+            guard let first = parts.first else { continue }
+            children["", default: []].insert(String(first))
+            if parts.count == 2 {
+                children[String(first), default: []].insert(String(parts[1]))
+            }
+        }
+        childrenByDirectory = children
+    }
+
+    func fileExists(atPath path: String) -> Bool { paths.contains(String(path.dropFirst())) }
+    func metadata(at url: URL) -> Data? {
+        manifest.metadata[String(url.path.dropFirst())].map { Data($0.utf8) }
+    }
+    func children(of directory: URL) -> [URL] {
+        (childrenByDirectory[String(directory.path.dropFirst())] ?? []).map {
+            directory.appendingPathComponent($0)
+        }
+    }
+}
+
+
+enum ImagePackageCompatibility: Equatable, Sendable {
+    case recognized
+    case unknown
+    case blocked(String)
+
+    var blocker: String? {
+        if case .blocked(let reason) = self { return reason }
+        return nil
+    }
 }

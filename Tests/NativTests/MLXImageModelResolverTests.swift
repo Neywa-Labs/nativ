@@ -44,6 +44,26 @@ final class MLXImageModelResolverTests: XCTestCase {
         try super.tearDownWithError()
     }
 
+    func testRemotePreflightChecksAdaptersAndMissingComponents() {
+        func blocker(_ model: String, _ paths: [String], _ metadata: [String: String] = [:]) -> String? {
+            resolver().downloadBlocker(for: ImageDownloadManifest(
+                model: model, paths: paths + Array(metadata.keys), metadata: metadata, metadataComplete: true
+            ))
+        }
+        let adapter = blocker("data-archetype/moss_image_base_dmd2", ["transformer/adapter_model.safetensors"], [
+            "transformer/adapter_config.json": #"{"peft_type":"LORA","base_model_name_or_path":"OpenMOSS-Team/MOSS-Image-Base"}"#
+        ])
+        XCTAssertTrue(adapter?.contains("OpenMOSS-Team/MOSS-Image-Base") == true)
+        XCTAssertTrue(blocker("deepsweet/Z-Image-Turbo", [])?.contains("scheduler/scheduler_config.json") == true)
+        let flux2 = ["transformer/model.safetensors", "text_encoder/model.safetensors", "vae/model.safetensors", "tokenizer/tokenizer.json"]
+        XCTAssertNil(blocker("org/flux2-klein-4b", flux2))
+        XCTAssertNotNil(blocker("org/flux2-klein-4b", Array(flux2.dropLast())))
+        XCTAssertNil(blocker("org/unknown", []))
+        XCTAssertNotNil(blocker("org/flux-3-image-klein", [], [
+            "config.json": #"{"model":"flux-3-image-klein","dit":{"in_channels":{"image":1,"image_cond":1,"text":1}},"quantization":{"bits":4}}"#
+        ]))
+    }
+
     func testDiffusionGemmaIsNotImageGenerationModel() throws {
         try writeJSON(
             [
