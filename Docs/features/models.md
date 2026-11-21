@@ -17,7 +17,8 @@ Discover shows the total size of the files selected for download, including toke
 additional weight formats in the repository. Optional GGUF files are excluded. Sizes load in
 the background for visible rows; “Checking size…” changes to a verified total or “Size unavailable.”
 Size sorting uses these totals across the buffered search results. Memory-fit warnings remain
-separate estimates of runtime memory needs.
+separate estimates of runtime memory needs. Enable **Fits in memory** to show only models
+estimated to fit on this Mac. Models with unknown sizes are hidden while the filter is on.
 
 ## External model storage
 
