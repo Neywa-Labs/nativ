@@ -40,7 +40,7 @@ final class HuggingFaceDownloadPreflightTests: XCTestCase {
             assert kwargs['dry_run'] is True
             assert kwargs['revision'] == 'requested-commit'
             assert kwargs['ignore_patterns'] == ignored_patterns
-            return [SimpleNamespace(file_size=s, will_download=d, commit_hash=c) for s,d,c in \(files)]
+            return [SimpleNamespace(filename="model.safetensors", file_size=s, will_download=d, commit_hash=c) for s,d,c in \(files)]
         \(HuggingFaceDownloadPreflight.script)
         print('resolved=' + revision)
         """

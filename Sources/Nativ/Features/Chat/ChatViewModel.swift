@@ -2305,6 +2305,7 @@ final class ChatViewModel: ObservableObject {
                 try await HuggingFaceDownloadManager.shared.downloadIfNeeded(
                     repoID: selectedModel.modelID,
                     sizeBytes: selectedModel.downloadSizeBytes,
+                    imageDownload: true,
                     cachePath: preparationContext.modelSearchPath,
                     volumeIdentifier: preparationContext.modelCacheVolumeIdentifier,
                     token: preparationContext.huggingFaceToken

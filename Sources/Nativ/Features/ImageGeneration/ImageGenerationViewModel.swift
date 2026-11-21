@@ -481,6 +481,7 @@ final class ImageGenerationViewModel: ObservableObject {
                     try await HuggingFaceDownloadManager.shared.downloadIfNeeded(
                         repoID: requestModelID,
                         sizeBytes: nil,
+                        imageDownload: true,
                         cachePath: modelSearchPath,
                         volumeIdentifier: modelCacheVolumeIdentifier,
                         token: huggingFaceToken

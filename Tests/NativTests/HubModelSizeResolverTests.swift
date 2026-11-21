@@ -28,6 +28,25 @@ final class HubModelSizeResolverTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-token")
     }
 
+    func testDiscoverChecksImageConfigAtListedCommitBeforeDownload() async throws {
+        let listing = Data(#"{"sha":"abc123","siblings":[{"rfilename":"model_index.json","size":100},{"rfilename":"unet/weights.safetensors","size":9000000}]}"#.utf8)
+        let request = HubModelSizeResolver.Request(repoID: "org/model", token: "token", checkImage: false)
+        let result = await HubModelSizeResolver.imageCompatibility(request: request, data: listing) { request in
+            XCTAssertEqual(request.url?.path, "/org/model/resolve/abc123/model_index.json")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer token")
+            return Data(#"{"_class_name":"StableDiffusionXLPipeline"}"#.utf8)
+        }
+        XCTAssertTrue(result?.blocker?.contains("SDXL") == true)
+    }
+
+    func testDiscoverLeavesUnverifiedImagesUnknown() async {
+        let listing = Data(#"{"sha":"abc123","siblings":[{"rfilename":"config.json","size":9000000}]}"#.utf8)
+        let result = await HubModelSizeResolver.imageCompatibility(
+            request: .init(repoID: "org/model", checkImage: true), data: listing
+        ) { _ in XCTFail("Oversized metadata must be skipped"); return nil }
+        XCTAssertEqual(result, .unknown)
+    }
+
     func testBoundsConcurrentLookups() async {
         let probe = SizeFetchProbe()
         let resolver = HubModelSizeResolver(maximumConcurrentRequests: 3, debounce: .zero) { await probe.fetch($0) }
