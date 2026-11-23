@@ -53,6 +53,7 @@ private struct HubSearchTaskID: Hashable {
     let direction: HuggingFaceSortDirection
     let capabilities: Set<LocalModelCapability>
     let access: HubAccessFilter
+    let fitsInMemoryOnly: Bool
     let authenticationToken: String?
 }
 
@@ -244,6 +245,7 @@ struct ModelsView: View {
     @State private var hubSort: HuggingFaceModelSort = .trending
     @State private var hubSortDirection: HuggingFaceSortDirection = .descending
     @State private var hubCapabilityFilters = Set<LocalModelCapability>()
+    @State private var fitsInMemoryOnly = false
     @State private var hubAccessFilter: HubAccessFilter = .all
     @State private var handledSpeechModelDiscoveryRequest = 0
     @State private var handledImageModelDiscoveryRequest = 0
@@ -880,6 +882,7 @@ struct ModelsView: View {
             sort: hubSort,
             direction: hubSortDirection,
             capabilities: hubCapabilityFilters,
+            fitsInMemoryOnly: fitsInMemoryOnly,
             predicate: hubVisibilityPredicate,
             token: modelState.effectiveHuggingFaceToken
         )
@@ -907,7 +910,7 @@ struct ModelsView: View {
             }
         } else if hubLibrary.models.isEmpty {
             ScrollView {
-                if hubCapabilityFilters.isEmpty && hubAccessFilter == .all {
+                if hubCapabilityFilters.isEmpty && hubAccessFilter == .all && !fitsInMemoryOnly {
                     ModelsEmptyState(
                         systemImage: "magnifyingglass",
                         title: "No Safetensors models found",
@@ -921,11 +924,16 @@ struct ModelsView: View {
                         systemImage: "line.3.horizontal.decrease.circle",
                         title: "No models match these filters",
                         message:
-                            "Try another model type, capability, or access filter, or continue to the next page.",
+                            fitsInMemoryOnly
+                            ? "Turn off Fits in memory to include larger models and models with unknown sizes."
+                            : "Try changing your capability or access filters.",
                         actionTitle: nil,
                         action: {}
                     )
                     .modelsListRow()
+                    if hubLibrary.canGoToNextPage {
+                        discoverPagination.modelsListRow()
+                    }
                 }
             }
         } else {
@@ -1312,6 +1320,7 @@ struct ModelsView: View {
                 hubSortDirectionPicker
                 hubCapabilityPicker
                 hubAccessPicker
+                memoryFitToggle
                 Spacer(minLength: 8)
                 shownModelCount
             }
@@ -1328,9 +1337,16 @@ struct ModelsView: View {
                     hubCapabilityPicker
                     hubAccessPicker
                 }
+                memoryFitToggle
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var memoryFitToggle: some View {
+        Toggle("Fits in memory", isOn: $fitsInMemoryOnly)
+            .toggleStyle(.checkbox)
+            .help("Show only models estimated to fit in this Mac’s memory. Models with unknown sizes are hidden.")
     }
 
     private var hubSortPicker: some View {
@@ -1608,6 +1624,7 @@ struct ModelsView: View {
             direction: hubSortDirection,
             capabilities: hubCapabilityFilters,
             access: hubAccessFilter,
+            fitsInMemoryOnly: fitsInMemoryOnly,
             authenticationToken: modelState.effectiveHuggingFaceToken
         )
     }
