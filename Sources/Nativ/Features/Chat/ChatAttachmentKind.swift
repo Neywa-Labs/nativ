@@ -1,5 +1,6 @@
 import Foundation
 import UniformTypeIdentifiers
+import Vision
 
 enum ChatAttachmentKind: Equatable, Sendable {
     case image
@@ -35,6 +36,33 @@ enum ChatWorkAttachments {
             }
             return attachment
         }
+    }
+
+    @concurrent
+    static func transcript(_ images: [ChatImageAttachment], html: Bool) async throws -> String {
+        let files = try await load(images)
+        var pages: [String] = []
+        for file in files {
+            try Task.checkCancellation()
+            let recognition = VNRecognizeTextRequest()
+            recognition.recognitionLevel = .accurate
+            recognition.automaticallyDetectsLanguage = true
+            try VNImageRequestHandler(data: file.data).perform([recognition])
+            let text = (recognition.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ChatWorkError.invalid("No readable text found in “\(file.filename)”.")
+            }
+            if html {
+                let escaped = text.replacingOccurrences(of: "&", with: "&amp;")
+                    .replacingOccurrences(of: "<", with: "&lt;")
+                    .replacingOccurrences(of: ">", with: "&gt;")
+                pages.append("<section><pre>\(escaped)</pre></section>")
+            } else {
+                pages.append(text)
+            }
+        }
+        let body = pages.joined(separator: "\n\n")
+        return html ? "<!doctype html><meta charset=utf-8><style>pre{white-space:pre-wrap}section{break-after:page}</style><main>\(body)</main>" : body
     }
 
     static func listJSON(in messages: [ChatTranscriptMessage]) throws -> String {

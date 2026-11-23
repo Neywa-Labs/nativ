@@ -998,6 +998,20 @@ final class ChatViewModel: ObservableObject {
         }
         var request = try request.resolvingElementOpen(sourceURL: source?.url)
         if let source { request.id = source.id }
+        if request.transcribeImages == true {
+            guard request.action == .create, request.kind == .website || request.kind == .document,
+                  request.content == nil, request.appendContent == nil, request.url == nil else {
+                throw ChatWorkError.invalid("transcribe_images requires create with kind website or document and no content or URL.")
+            }
+            let messages = sessionMessages(for: sessionID) ?? []
+            let ids = request.attachmentIDs ?? messages.last(where: { $0.role == .user })?.imageAttachments
+                .filter { $0.chatAttachmentKind == .image }.map(\.id)
+            let images = try ChatWorkAttachments.resolve(ids, in: messages)
+            guard images.allSatisfy({ $0.chatAttachmentKind == .image }) else {
+                throw ChatWorkError.invalid("Select only image attachments for transcription.")
+            }
+            request.attachmentIDs = images.map(\.id)
+        }
         if request.action == .upload {
             _ = try ChatWorkAttachments.resolve(request.attachmentIDs, in: sessionMessages(for: sessionID) ?? [])
         }
@@ -1102,8 +1116,15 @@ final class ChatViewModel: ObservableObject {
         if request.action.isTerminalMutation, !terminalApprovalGranted {
             throw ChatTerminalToolError.approvalRequired
         }
+        var request = try resolvedWorkRequest(request, in: sessionID)
+        if request.transcribeImages == true {
+            let images = try ChatWorkAttachments.resolve(request.attachmentIDs, in: sessionMessages(for: sessionID) ?? [])
+            let ext = ((request.title ?? "") as NSString).pathExtension.lowercased()
+            let html = request.kind == .website || ["html", "htm"].contains(ext)
+            request.content = try await ChatWorkAttachments.transcript(images, html: html)
+            try Task.checkCancellation()
+        }
         try refreshWorkFiles(in: sessionID)
-        let request = try resolvedWorkRequest(request, in: sessionID)
         guard var state = workState(for: sessionID) else { throw ChatWorkError.unavailable }
         if let item = state.items.first(where: { $0.id == (request.id ?? state.selectedID) }), item.kind == .terminal {
             let terminal = workTerminal(for: item, sessionID: sessionID)
@@ -1164,7 +1185,7 @@ final class ChatViewModel: ObservableObject {
             terminal.startIfNeeded()
             return try terminal.snapshot(itemID: item.id)
         }
-        if request.action == .create || request.action == .update, let item = state.selectedItem,
+        if request.transcribeImages != true, request.action == .create || request.action == .update, let item = state.selectedItem,
            item.resolvedKind == .website {
             return try await executeBrowserAction(ChatWorkRequest(action: .inspect, id: item.id),
                                                   item: item, sessionID: sessionID)
@@ -2156,7 +2177,7 @@ final class ChatViewModel: ObservableObject {
         )
     }
 
-    private func enqueueGeneration(
+    func enqueueGeneration(
         for userMessageID: UUID,
         in sessionID: UUID,
         settings: NativSettings,
@@ -2875,6 +2896,7 @@ final class ChatViewModel: ObservableObject {
         )
         var assistantMessageID = queuedRequest.assistantMessageID
         var toolRounds = 0
+        var incompleteCallRetryID: UUID?
         var researchContinuations = 0
         var tracksWorkSaves = workState(for: request.sessionID)?.items.contains(where: \.canEdit) == true
         var savedWorkFiles: [UUID: String] = [:]
@@ -2939,6 +2961,7 @@ final class ChatViewModel: ObservableObject {
             if advertisesTools, request.tools?.contains(where: { $0.function.name == ChatWorkToolRegistry.toolName }) == true {
                 request.completionInstruction = [
                     request.completionInstruction,
+                    incompleteCallRetryID == assistantMessageID ? ChatWorkToolRegistry.incompleteCallInstruction : nil,
                     ChatBrowserEvidence.missingPageInstruction(messages: request.messages),
                     ChatBrowserEvidence.stalledSearchInstruction(messages: request.messages),
                 ].compactMap { $0 }.joined(separator: "\n\n")
@@ -2955,10 +2978,22 @@ final class ChatViewModel: ObservableObject {
                     in: streamingSessionID
                 )
             }
+            let originalMessage = message(streamingMessageID, in: streamingSessionID)
             let eventRelay = ChatStreamEventRelay(delivery: appendEvent)
             let completion: MLXChatCompletion
+            var transcriptCall: MLXChatCompletion?
             do {
-                if request.continuation?.responses ?? queuedRequest.settings.compactionEnabled {
+                if toolRounds == 0, incompleteCallRetryID == nil, !queuedRequest.appendsToResponse,
+                   let user = message(queuedRequest.userMessageID, in: streamingSessionID),
+                   let routing = ChatWorkToolRegistry.htmlTranscriptRoutingRequest(for: user, original: request),
+                   let candidate = try? await client.completeChat(routing),
+                   ChatWorkToolRegistry.isTranscriptionCompletion(candidate) {
+                    transcriptCall = candidate
+                }
+                try Task.checkCancellation()
+                if let transcriptCall {
+                    completion = transcriptCall
+                } else if request.continuation?.responses ?? queuedRequest.settings.compactionEnabled {
                     var contextLimit = try await responsesClient.contextLimit(for: request.model)
                     for path in activeSettings.localModelSearchPaths.all {
                         let metadata = await LocalModelDiscovery.configurationMetadata(
@@ -3014,6 +3049,13 @@ final class ChatViewModel: ObservableObject {
                 eventRelay.finish()
             } catch {
                 eventRelay.cancel()
+                try Task.checkCancellation()
+                if incompleteCallRetryID == nil, ChatWorkToolRegistry.canRecoverIncompleteCall(error, request: request),
+                   ownsActiveRequest(queuedRequest.id), let originalMessage {
+                    updateMessage(streamingMessageID, in: streamingSessionID) { $0 = originalMessage }
+                    incompleteCallRetryID = streamingMessageID
+                    continue
+                }
                 throw error
             }
             let toolCalls = normalizedToolCalls(completion.toolCalls)
@@ -3380,6 +3422,12 @@ final class ChatViewModel: ObservableObject {
                 )
             else {
                 throw NativChatError.invalidResponse
+            }
+            if transcriptCall != nil, let title = savedWorkFiles.values.first {
+                finishAssistantMessage(assistantMessageID, in: queuedRequest.sessionID,
+                    fallbackContent: "Saved the transcript to “\(title)” in the work pane.",
+                    fallbackReasoningContent: nil, responseMetrics: nil, savedWorkFiles: [title], isCancelled: false)
+                return
             }
         }
     }

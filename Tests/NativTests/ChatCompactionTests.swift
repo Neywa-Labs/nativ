@@ -352,6 +352,24 @@ final class ChatCompactionTests: XCTestCase {
         XCTAssertThrowsError(try unfinished.result(elapsed: 1))
     }
 
+    func testIncompleteWorkCallAllowsFreshRequestWithoutDispatchingPartialArguments() throws {
+        var stream = MLXResponseStream()
+        _ = try stream.consume(#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c1","name":"chat_work"}}"#)
+        _ = try stream.consume(#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{"}"#)
+        var retry = request([.init(role: "user", content: "Assemble the pages")])
+        retry.tools = [ChatWorkToolRegistry.definition]
+        let failure = #"{"type":"response.failed","response":{"error":{"code":"server_error","message":"Generation ended with an incomplete tool call."}}}"#
+        XCTAssertThrowsError(try stream.consume(failure)) { error in
+            XCTAssertTrue(ChatWorkToolRegistry.canRecoverIncompleteCall(error, request: retry))
+            retry.continueFinalMessage = true
+            XCTAssertFalse(ChatWorkToolRegistry.canRecoverIncompleteCall(error, request: retry))
+            retry.continueFinalMessage = false
+            retry.tools = nil
+            XCTAssertFalse(ChatWorkToolRegistry.canRecoverIncompleteCall(error, request: retry))
+        }
+        XCTAssertThrowsError(try stream.result(elapsed: 1))
+    }
+
     func testContextLimitedResponsePreservesPartialAnswerAndReportsLength() throws {
         var stream = MLXResponseStream()
         _ = try stream.consume(#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"1 2 3"}]}],"usage":{"input_tokens":4064,"output_tokens":32,"total_tokens":4096}}}"#)
