@@ -199,6 +199,61 @@ final class HuggingFaceDownloadCapacityTests: XCTestCase {
         XCTAssertNoThrow(try capacity.reserve(UUID(), bytes: 10, atPath: directory.path))
     }
 
+    func testImagePreflightReadsPinnedConfigAndStopsSDXLBeforeWeights() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let capacity = HuggingFaceDownloadCapacity { _ in .init(volume: 1, freeBytes: 100) }
+        let download = operation(
+            capacity: capacity, directory: directory, bytes: 1,
+            beforeResolution: """
+            from pathlib import Path
+            def config_download(*, repo_id, filename, revision, cache_dir, local_dir):
+                assert repo_id == 'org/model' and filename == 'model_index.json'
+                assert revision == 'resolved-commit'
+                path = Path(local_dir) / filename
+                path.write_text('{"_class_name":"StableDiffusionXLPipeline"}')
+                return path
+            sys.modules['huggingface_hub'] = SimpleNamespace(hf_hub_download=config_download)
+            return [SimpleNamespace(filename=f, file_size=50, is_cached=False, will_download=True, commit_hash='resolved-commit')
+                    for f in ['model_index.json', 'unet/model.safetensors']]
+            """,
+            afterApproval: "raise AssertionError('unexpected weight transfer')"
+        )
+        do {
+            try await Task.detached { try download.run() }.value
+            XCTFail("Expected SDXL compatibility failure")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("SDXL"), error.localizedDescription)
+        }
+    }
+
+    func testCachedImageMetadataIsCheckedOffline() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let capacity = HuggingFaceDownloadCapacity { _ in .init(volume: 1, freeBytes: 1000) }
+        let download = operation(
+            capacity: capacity, directory: directory, bytes: 1,
+            beforeResolution: """
+            from pathlib import Path
+            def unexpected_fetch(**kwargs):
+                raise AssertionError('requested metadata that was already cached')
+            sys.modules['huggingface_hub'] = SimpleNamespace(hf_hub_download=unexpected_fetch)
+            path = Path(sys.argv[2]) / 'cached-adapter-config.json'
+            path.write_text('{"peft_type":"LORA","base_model_name_or_path":"OpenMOSS-Team/MOSS-Image-Base"}')
+            return [SimpleNamespace(filename=f, file_size=path.stat().st_size, will_download=False,
+                                    is_cached=True, local_path=str(path), commit_hash='resolved-commit')
+                    for f in ['transformer/adapter_model.safetensors', 'transformer/adapter_config.json']]
+            """,
+            afterApproval: "raise AssertionError('unexpected weight transfer')"
+        )
+        do {
+            try await Task.detached { try download.run() }.value
+            XCTFail("Expected adapter compatibility failure")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("OpenMOSS-Team/MOSS-Image-Base"), error.localizedDescription)
+        }
+    }
+
     private func temporaryDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -219,7 +274,7 @@ final class HuggingFaceDownloadCapacityTests: XCTestCase {
             assert kwargs['dry_run'] is True
             size = \(bytes)
         \(beforeResolution.split(separator: "\n", omittingEmptySubsequences: false).map { "    " + $0 }.joined(separator: "\n"))
-            return [SimpleNamespace(file_size=size, will_download=True, commit_hash='resolved-commit')]
+            return [SimpleNamespace(filename="model.safetensors", file_size=size, will_download=True, commit_hash='resolved-commit')]
         \(HuggingFaceDownloadPreflight.script)
         print('__NATIV_STAGE__:downloading', flush=True)
         \(afterApproval)

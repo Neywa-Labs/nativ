@@ -803,6 +803,8 @@ private struct WelcomeView: View {
         downloadManager.download(
             repoID: hubModel.id,
             sizeBytes: downloadSize(for: hubModel),
+            revision: hubModel.revision,
+            imageDownload: !hubModel.capabilities.isDisjoint(with: [.imageGeneration, .imageEditing]),
             cachePath: model.settings.modelSearchPath,
             volumeIdentifier: model.settings.externalModelCache?.volumeIdentifier,
             token: model.effectiveHuggingFaceToken
